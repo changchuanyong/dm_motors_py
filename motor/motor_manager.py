@@ -404,9 +404,12 @@ class MotorManager:
         )
 
     def enable_all(self) -> None:
-        """使能全部电机，并确认每台都回了新反馈、反馈码确实发生了变化。"""
+        """使能全部电机：先同步当前状态，再确认每台回了新反馈、反馈码变化，最后重收一轮反馈；已处于上次实测使能稳态码的电机视为已使能。"""
         if not self._configured:
             raise RuntimeError("请先调用 configure() 应用电机配置")
+        # 先同步一次状态：SDK 的 disable() 只发帧不读应答，失能应答会滞留在接收缓冲里，
+        # 直接拿旧缓存当基线会把"使能成功"误判成"反馈码没有变化"（一次运行后再次使能必踩）。
+        self.refresh_status()
         silent = [motor.SlaveID for motor in self.motors if motor.feedback_count == 0]
         if silent:
             raise RuntimeError(
@@ -414,6 +417,8 @@ class MotorManager:
                 + "、".join(f"0x{slave_id:02X}" for slave_id in silent)
                 + "（检查 Slave ID、接线、PC 侧与 CAN 侧波特率）"
             )
+        # 重复使能的豁免依据：上一次成功 enable_all 记录的使能稳态码（首次调用时为空）
+        previous_steady = dict(self._enabled_code)
         self._enabled_code.clear()
         try:
             before_count = {motor.SlaveID: motor.feedback_count for motor in self.motors}
@@ -428,13 +433,18 @@ class MotorManager:
                         f"电机 0x{slave_id:02X} 使能后没有收到新反馈，无法确认已使能"
                     )
                 code = int(motor.getError())
-                if code == before_code[slave_id]:
+                # 码没变但恰好等于上次实测的使能稳态码：电机本来就处于使能态（重复调用
+                # enable_all），视为已使能；不引入"0x01=使能"的书面语义，只信本会话实测值。
+                if code == before_code[slave_id] and code != previous_steady.get(slave_id):
                     raise RuntimeError(
                         f"电机 0x{slave_id:02X} 使能后反馈码仍是 0x{code:X}"
                         f"（{_STATUS_NAMES.get(code, '未知状态')}），使能未生效"
                     )
                 self._enabled_code[slave_id] = code
             self._check_errors()
+            # SDK 每台使能固定等 100 ms，多台依次使能后第 1 台的反馈已经变旧，
+            # 这里重收一轮反馈，避免进入控制循环时误报"反馈超时"。
+            self.refresh_status()
         except BaseException:
             self._enabled_code.clear()
             self.disable_all()

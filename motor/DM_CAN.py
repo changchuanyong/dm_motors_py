@@ -44,9 +44,12 @@ from struct import pack
 PARAM_REPLY_MARKERS = (0x33, 0x55, 0xAA)
 # 待处理请求的有效期，覆盖 SDK 自身 20 × 0.05 s 的重试窗口。
 PARAM_REPLY_TIMEOUT = 1.0
-# 参数命令结束后的保护窗口：窗口内出现无主的参数类应答就丢弃（防止迟到的应答污染位置反馈），
-# 窗口外一律按反馈解析——否则静止电机的反馈帧只要位置低字节命中标记就会被永久丢弃。
+# 参数命令结束后的保护窗口：窗口内出现无主的参数类应答就丢弃（防止迟到的应答污染位置反馈）。
 PARAM_REPLY_GUARD = 0.1
+# 参数类应答里 data[3] 是寄存器 RID（保存应答为 0x01），本项目读写的 RID 都 ≤ 23，固件暴露
+# 0..36；状态帧里 data[3] 是速度的高字节，所以 "data[3] <= 36" 等价于速度 ≤ -32 rad/s 的急落，
+# 不可能长期成立——用它做判据既与到达时间无关，又不会让静止电机在碰撞位置持续失明。
+PARAM_REPLY_RID_MAX = 36
 
 class Motor:
     def __init__(self, MotorType, SlaveID, MasterID):
@@ -155,7 +158,7 @@ class MotorControl:
         self.data_save = bytes()  # save data
         self._param_request = None  # 待处理参数类请求 (slave_id, rid 或 None, 截止时间)
         self._param_guard_until = 0.0  # 参数命令后的保护窗口截止时间
-        self.dropped_param_replies = 0  # 保护窗口内丢弃的无主参数类应答帧数
+        self.dropped_param_replies = 0  # 丢弃的无主参数类应答帧数（命中 RID 与到达时间无关，或在保护窗口内）
         self.ignored_frames = 0  # CMD != 0x11 的适配器帧数（如 0xEE 通信错误）
         if self.serial_.is_open:  # open the serial port
             print("Serial port is open")
@@ -387,7 +390,9 @@ class MotorControl:
                     self._param_request = None
                     self._param_guard_until = monotonic() + PARAM_REPLY_GUARD
                     self.__process_set_param_packet(data, CANID, CMD)
-                elif monotonic() <= self._param_guard_until:
+                elif int(data[3]) <= PARAM_REPLY_RID_MAX or monotonic() <= self._param_guard_until:
+                    # data[3] 命中 RID（或保存标记）就丢弃，与到达时间无关；静止电机的状态帧
+                    # 速度≈0 → data[3]≈127，不满足该条件，因此不会被误丢。
                     self.dropped_param_replies += 1
                 else:
                     self.__process_packet(data, CANID, CMD)

@@ -2,6 +2,7 @@
 
 import io
 import math
+import time
 from contextlib import redirect_stdout
 from pathlib import Path
 import runpy
@@ -69,9 +70,11 @@ class FakeControl:
         self.fault_on_command = None
         self.enabled_code = 0x01     # 使能后的反馈码
         self.disabled_code = 0x00    # 失能后的反馈码
+        self.replies = True          # False：电机完全不回应答（模拟没接上/掉线）
         self.command_replies = True  # False：控制帧不再产生反馈（模拟运行中掉线）
         self.enable_replies = True   # False：使能后不回帧
         self.disable_replies = True  # False：失能后不回帧
+        self._buffered = []          # 滞留的应答（失能应答要等下一次接收才被解析）
         self.Limit_Param = {DM_Motor_Type.DM6006: list(limits)}
         self.param_values = {}       # (slave_id, rid) -> 读参数返回值；缺省用量程表
         self.limit_calls = []
@@ -84,12 +87,14 @@ class FakeControl:
 
     def disable(self, motor):
         self.events.append(("disable", motor.SlaveID))
-        if self.disable_replies:
-            self._feedback(motor, self.disabled_code)
+        if self.replies and self.disable_replies:
+            # 真实 SDK 的 disable() 只发帧不读应答，失能应答要等下一次接收才被解析
+            self._buffered.append((motor, self.disabled_code))
 
     def enable(self, motor):
         self.events.append(("enable", motor.SlaveID))
-        if self.enable_replies:
+        time.sleep(0.1)  # 官方 SDK 的固定等待；多台依次使能会累加
+        if self.replies and self.enable_replies:
             self._feedback(motor, self.enabled_code)
 
     def switchControlMode(self, motor, mode):
@@ -104,10 +109,18 @@ class FakeControl:
         self.events.append(("save", motor.SlaveID))
 
     def refresh_motor_status(self, motor):
-        pass
+        self._drain()
+        if self.replies:
+            self._feedback(motor, motor.getError())  # 真实电机会应答一帧反馈
 
     def recv(self):
-        pass
+        self._drain()
+
+    def _drain(self):
+        """解析滞留的应答（真实 SDK 在下一次 recv 时才读到失能应答）。"""
+        pending, self._buffered = self._buffered, []
+        for motor, code in pending:
+            self._feedback(motor, code)
 
     def read_motor_param(self, motor, rid):
         if (motor.SlaveID, rid) in self.param_values:
@@ -130,7 +143,7 @@ class FakeControl:
         self.commands.append((name, motor.SlaveID, *values))
         if self.fault_on_command == motor.SlaveID:
             motor.state_err = 0x08
-        elif self.command_replies:
+        elif self.replies and self.command_replies:
             self._feedback(motor, self.enabled_code)
 
     def controlMIT(self, motor, kp, kd, q, dq, tau):
@@ -171,7 +184,9 @@ class MotorManagerTests(unittest.TestCase):
         manager.enable_all()
         return manager, control
 
-    def run_manager(self, manager, *, seconds=0.01, period=0.01, feedback_timeout=0.2):
+    def run_manager(self, manager, *, seconds=0.005, period=0.01, feedback_timeout=0.2):
+        # seconds 取 0.005 而不是 0.01：与 period 相等时循环条件卡在浮点边界
+        # （0.01 的浮点误差会让"跑一轮"变成"跑两轮"），留出余量才是稳定的一轮
         manager.run(RunConfig(seconds=seconds, period=period, feedback_timeout=feedback_timeout))
 
     def test_four_modes_forward_distinct_sdk_parameters(self):
@@ -299,7 +314,7 @@ class MotorManagerTests(unittest.TestCase):
             PositionVelocityControl(P_desired=-0.5, V_desired=0.2),
             motion=SineMotion(amplitude=0.1, frequency=1.0, phase=math.pi / 2),
         ))
-        self.run_manager(manager, seconds=0.5, period=0.25, feedback_timeout=1.0)
+        self.run_manager(manager, seconds=0.45, period=0.25, feedback_timeout=1.0)
         self.assertEqual(len(control.commands), 2)
         self.assertAlmostEqual(control.commands[0][2], -0.4)
         self.assertAlmostEqual(control.commands[1][2], -0.5)
@@ -382,7 +397,7 @@ class MotorManagerTests(unittest.TestCase):
     def test_run_refuses_without_any_feedback(self):
         """P1-1 回归：一次反馈都没收到时不允许使能，更不允许进入控制循环。"""
         control = FakeControl()
-        control.disable_replies = False
+        control.replies = False
         manager = MotorManager(
             control, configs=(MotorConfig(1, 0x11, VelocityControl(Vel_desired=0.1)),)
         )
@@ -395,7 +410,7 @@ class MotorManagerTests(unittest.TestCase):
 
     def test_none_position_requires_feedback_before_use(self):
         control = FakeControl()
-        control.disable_replies = False
+        control.replies = False
         manager = MotorManager(
             control,
             configs=(
@@ -422,6 +437,39 @@ class MotorManagerTests(unittest.TestCase):
             self.run_manager(manager, seconds=1.0, period=0.01, feedback_timeout=0.2)
         self.assertIn("反馈超时", str(caught.exception))
         self.assertCountEqual(control.events, [("disable", 1), ("disable", 3)])
+
+    def test_reenable_after_run_is_not_a_false_failure(self):
+        """P2 回归：run() 结束时失能（SDK 不读应答），再次使能不得拿旧缓存误报"未生效"。"""
+        manager, _ = self.make_manager(
+            MotorConfig(1, 0x11, VelocityControl(Vel_desired=0.1))
+        )
+        self.run_manager(manager)  # 跑一轮 → 结束时失能，缓存仍是 0x01 的旧值
+        manager.enable_all()       # 修复前：抛「使能后反馈码仍是 0x1（已使能），使能未生效」
+        self.assertEqual(manager.motors[0].getError(), 0x01)
+
+    def test_double_enable_all_is_idempotent(self):
+        """回归：对已使能电机重复调用 enable_all() 不得误报"使能未生效"并失能。"""
+        manager, control = self.make_manager(
+            MotorConfig(1, 0x11, VelocityControl(Vel_desired=0.1))
+        )
+        control.events.clear()
+        manager.enable_all()  # 修复前：抛「使能未生效」并在 except 分支失能全部电机
+        self.assertEqual(manager.motors[0].getError(), 0x01)
+        self.assertIn(("enable", 1), control.events)
+        self.assertEqual([event for event in control.events if event[0] == "disable"], [])
+        self.assertEqual(manager._enabled_code[1], 0x01)
+
+    def test_many_motors_do_not_false_trigger_feedback_timeout(self):
+        """P1 回归：每台使能固定等 100 ms，多台依次使能后旧帧不能触发假超时。"""
+        manager, control = self.make_manager(
+            MotorConfig(1, 0x21, VelocityControl(Vel_desired=0.1)),
+            MotorConfig(3, 0x23, VelocityControl(Vel_desired=0.1)),
+            MotorConfig(5, 0x25, VelocityControl(Vel_desired=0.1)),
+            MotorConfig(7, 0x27, VelocityControl(Vel_desired=0.1)),
+        )
+        # 修复前：第 1 台的反馈已过去 0.3 s > 0.2 s，第一轮就抛"反馈超时"
+        self.run_manager(manager)
+        self.assertEqual([command[1] for command in control.commands], [1, 3, 5, 7])
 
     def test_enable_without_new_feedback_is_rejected(self):
         control = FakeControl()
@@ -690,12 +738,8 @@ class MotorControlRoutingTests(unittest.TestCase):
         self.assertEqual(motor.temp_param_dict, {})  # 0xAA 不解析成寄存器值
         self.assertEqual(motor.getPosition(), 1.25)
 
-    def test_param_reply_beyond_guard_is_parsed_as_feedback(self):
-        """已知取舍：超出保护窗口后，孤立的参数类应答会被当成反馈解析。
-
-        这是刻意选择——静止电机的反馈帧同样可能命中标记字节，而"永久丢弃"会让电机在
-        该位置彻底失明（实机已复现）。代价是这种极晚到达的应答会污染一次缓存位置。
-        """
+    def test_late_param_reply_is_dropped_even_beyond_guard(self):
+        """迟到的参数应答凭 RID 仍被认作参数类并丢弃，不再污染位置与反馈时间戳。"""
         motor = create_motor(0x01, 0x11)
         motor.state_q = 1.25
         sdk = self.make_sdk(
@@ -704,10 +748,28 @@ class MotorControlRoutingTests(unittest.TestCase):
         now = [0.0]
         with patch("motor.DM_CAN.sleep"), patch("motor.DM_CAN.monotonic", lambda: now[0]):
             sdk.save_motor_param(motor)
-            now[0] = 2.0  # 请求和保护窗口都已过期
+            now[0] = 2.0  # 请求与保护窗口都已过期
             sdk.recv()
+        self.assertEqual(sdk.dropped_param_replies, 1)
+        self.assertEqual(motor.getPosition(), 1.25)   # 位置未被污染
+        self.assertEqual(motor.feedback_count, 0)     # 也没被算成反馈
+        self.assertIsNone(motor.last_feedback_at)     # 时间戳没被刷新
+
+    def test_edge_stationary_feedback_is_not_dropped(self):
+        """防回归：静止在读数窗口边缘、data[2] 碰撞的状态帧仍按反馈解析（不能退回持续失明）。
+
+        该帧 data[1]=0（位置≈-12.44 在窗口负端）、data[2]=0xAA（命中标记），但 data[3]=0x7F
+        表示速度≈0 —— 正是实机上会出现的组合。
+        """
+        motor = create_motor(0x01, 0x11)
+        sdk = self.make_sdk(
+            motor, [make_frame(0x11, bytes([0x11, 0x00, 0xAA, 0x7F, 0xF8, 0x00, 0x21, 0x1E]))]
+        )
+        sdk.recv()
+        self.assertEqual(motor.feedback_count, 1)
         self.assertEqual(sdk.dropped_param_replies, 0)
-        self.assertAlmostEqual(motor.getPosition(), -12.48, delta=0.01)
+        self.assertEqual(motor.getError(), 0x01)
+        self.assertAlmostEqual(motor.getPosition(), -12.44, delta=0.05)
 
     def test_feedback_is_still_parsed_during_param_window(self):
         motor = create_motor(0x01, 0x11)
