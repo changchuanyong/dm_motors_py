@@ -405,7 +405,7 @@ class MotorManagerTests(unittest.TestCase):
         manager.configure()
         with self.assertRaises(RuntimeError) as caught:
             manager.enable_all()
-        self.assertIn("尚未收到任何反馈", str(caught.exception))
+        self.assertIn("没有收到新反馈", str(caught.exception))
         self.assertEqual(control.commands, [])
 
     def test_none_position_requires_feedback_before_use(self):
@@ -420,7 +420,6 @@ class MotorManagerTests(unittest.TestCase):
         self.addCleanup(manager.close)
         manager.configure()
         manager._enabled[1] = manager.motors[0]  # 绕过 enable_all 门禁，直接检验 run() 的兜底
-        manager._enabled_code[1] = 0x00
         with self.assertRaises(RuntimeError) as caught:
             manager.run(RunConfig(seconds=0.01))
         self.assertIn("没有可用反馈", str(caught.exception))
@@ -457,7 +456,6 @@ class MotorManagerTests(unittest.TestCase):
         self.assertEqual(manager.motors[0].getError(), 0x01)
         self.assertIn(("enable", 1), control.events)
         self.assertEqual([event for event in control.events if event[0] == "disable"], [])
-        self.assertEqual(manager._enabled_code[1], 0x01)
 
     def test_many_motors_do_not_false_trigger_feedback_timeout(self):
         """P1 回归：每台使能固定等 100 ms，多台依次使能后旧帧不能触发假超时。"""
@@ -502,10 +500,10 @@ class MotorManagerTests(unittest.TestCase):
             MotorConfig(3, 0x13, VelocityControl(Vel_desired=0.2)),
         )
         control.events.clear()
-        control.enabled_code = 0x00  # 运行中掉使能：反馈码偏离使能稳态码
+        control.enabled_code = 0x00  # 运行中掉使能
         with self.assertRaises(RuntimeError) as caught:
             self.run_manager(manager, seconds=1.0, period=0.01)
-        self.assertIn("反馈码由 0x1", str(caught.exception))
+        self.assertIn("已失能", str(caught.exception))
         self.assertCountEqual(control.events, [("disable", 1), ("disable", 3)])
 
     def test_limits_are_aligned_with_motor_values(self):
@@ -665,8 +663,8 @@ class MotorControlRoutingTests(unittest.TestCase):
         sdk.addMotor(motor)
         return sdk
 
-    def test_param_reply_within_guard_is_not_parsed_as_feedback(self):
-        """P1-2 回归：参数命令后保护窗口内滞留的应答不得被解析成位置反馈。"""
+    def test_expired_param_reply_is_not_parsed_as_feedback(self):
+        """过期且命令字不匹配的应答不得被解析成位置反馈。"""
         motor = create_motor(0x01, 0x11)
         motor.state_q = 1.25  # 先有一个正常位置
         sdk = self.make_sdk(
@@ -674,8 +672,8 @@ class MotorControlRoutingTests(unittest.TestCase):
         )
         now = [0.0]
         with patch("motor.DM_CAN.sleep"), patch("motor.DM_CAN.monotonic", lambda: now[0]):
-            sdk.save_motor_param(motor)  # 0.0：登记请求（窗口到 1.0，保护窗口到 1.1）
-            now[0] = 1.05                # 请求已过期，但仍在保护窗口内
+            sdk.save_motor_param(motor)  # 0.0：登记保存请求（截止时间 1.0）
+            now[0] = 1.05                # 请求已过期
             sdk.recv()
         # 若按反馈解析：data[1..2] = 0x0033 → 位置会被改成约 -12.48 rad
         self.assertEqual(motor.getPosition(), 1.25)
@@ -738,8 +736,8 @@ class MotorControlRoutingTests(unittest.TestCase):
         self.assertEqual(motor.temp_param_dict, {})  # 0xAA 不解析成寄存器值
         self.assertEqual(motor.getPosition(), 1.25)
 
-    def test_late_param_reply_is_dropped_even_beyond_guard(self):
-        """迟到的参数应答凭 RID 仍被认作参数类并丢弃，不再污染位置与反馈时间戳。"""
+    def test_late_param_reply_is_dropped(self):
+        """迟到的参数应答凭完整电机 ID 识别并丢弃，不污染位置与反馈时间戳。"""
         motor = create_motor(0x01, 0x11)
         motor.state_q = 1.25
         sdk = self.make_sdk(
@@ -748,7 +746,7 @@ class MotorControlRoutingTests(unittest.TestCase):
         now = [0.0]
         with patch("motor.DM_CAN.sleep"), patch("motor.DM_CAN.monotonic", lambda: now[0]):
             sdk.save_motor_param(motor)
-            now[0] = 2.0  # 请求与保护窗口都已过期
+            now[0] = 2.0  # 请求已过期
             sdk.recv()
         self.assertEqual(sdk.dropped_param_replies, 1)
         self.assertEqual(motor.getPosition(), 1.25)   # 位置未被污染
@@ -758,8 +756,8 @@ class MotorControlRoutingTests(unittest.TestCase):
     def test_edge_stationary_feedback_is_not_dropped(self):
         """防回归：静止在读数窗口边缘、data[2] 碰撞的状态帧仍按反馈解析（不能退回持续失明）。
 
-        该帧 data[1]=0（位置≈-12.44 在窗口负端）、data[2]=0xAA（命中标记），但 data[3]=0x7F
-        表示速度≈0 —— 正是实机上会出现的组合。
+        该帧 data[1]=0、data[2]=0xAA（命中标记），但首字节 0x11 含已使能状态，
+        不能把它当作已注册电机 1 的完整 Slave ID。
         """
         motor = create_motor(0x01, 0x11)
         sdk = self.make_sdk(

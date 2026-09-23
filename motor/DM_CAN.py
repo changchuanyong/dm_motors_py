@@ -27,8 +27,8 @@
 失能状态；模式修改后如需掉电保存，调用 save_motor_param。完整控制、参数读写和状态接口均在
 本文件的 MotorControl 类中。
 
-本文件是官方 u2can/DM_CAN.py 的副本，唯一实质改动是 recv()/recv_set_param_data() 的统一接收
-与分发：读(0x33)/写(0x55)/保存(0xAA)命令的应答不再可能被当成位置反馈解析。差异清单与官方依据见
+本文件保留官方 u2can/DM_CAN.py 的接口，并统一接收、请求匹配和残帧缓存：
+读(0x33)/写(0x55)/保存(0xAA)命令的应答按完整电机 ID 分发。差异清单与官方依据见
 项目根目录 docs/官方依据.md。
 """
 
@@ -44,12 +44,6 @@ from struct import pack
 PARAM_REPLY_MARKERS = (0x33, 0x55, 0xAA)
 # 待处理请求的有效期，覆盖 SDK 自身 20 × 0.05 s 的重试窗口。
 PARAM_REPLY_TIMEOUT = 1.0
-# 参数命令结束后的保护窗口：窗口内出现无主的参数类应答就丢弃（防止迟到的应答污染位置反馈）。
-PARAM_REPLY_GUARD = 0.1
-# 参数类应答里 data[3] 是寄存器 RID（保存应答为 0x01），本项目读写的 RID 都 ≤ 23，固件暴露
-# 0..36；状态帧里 data[3] 是速度的高字节，所以 "data[3] <= 36" 等价于速度 ≤ -32 rad/s 的急落，
-# 不可能长期成立——用它做判据既与到达时间无关，又不会让静止电机在碰撞位置持续失明。
-PARAM_REPLY_RID_MAX = 36
 
 class Motor:
     def __init__(self, MotorType, SlaveID, MasterID):
@@ -156,9 +150,8 @@ class MotorControl:
         self.serial_ = serial_device
         self.motors_map = dict()
         self.data_save = bytes()  # save data
-        self._param_request = None  # 待处理参数类请求 (slave_id, rid 或 None, 截止时间)
-        self._param_guard_until = 0.0  # 参数命令后的保护窗口截止时间
-        self.dropped_param_replies = 0  # 丢弃的无主参数类应答帧数（命中 RID 与到达时间无关，或在保护窗口内）
+        self._param_request = None  # (slave_id, rid 或 None, 命令字, 截止时间)
+        self.dropped_param_replies = 0  # 未匹配请求或存在歧义的参数类帧数
         self.ignored_frames = 0  # CMD != 0x11 的适配器帧数（如 0xEE 通信错误）
         if self.serial_.is_open:  # open the serial port
             print("Serial port is open")
@@ -381,21 +374,18 @@ class MotorControl:
                 # 适配器级帧：0x00 心跳、0x02 发送失败、0xEE 通信错误等，不含电机状态
                 self.ignored_frames += 1
                 continue
-            if int(data[1]) == 0 and data[2] in PARAM_REPLY_MARKERS:
-                # 参数类应答：data[0..1] 是 slave id、data[2] 是读/写/保存标记，此时 data[1..2]
-                # 不是位置字节，绝不能按反馈帧解析。要求 data[1]==0（ID 均小于 0x100，官方
-                # C/C++ 例程也从 data[0..1] 取 ID），否则静止电机的反馈帧只要位置低字节命中标记
-                # 就会被持续丢弃，例如实测帧 data=11 71 AA 7F F8 00 21 1E（位置 -1.3998 rad）。
-                if self.__pending_param_reply(data):
+            slave_id = (int(data[1]) << 8) | int(data[0])
+            motor = self.motors_map.get(slave_id)
+            if data[2] in PARAM_REPLY_MARKERS and motor is not None and motor.SlaveID == slave_id:
+                # motors_map 同时包含 Master ID；必须核对完整 Slave ID，避免把含状态高四位
+                # 的 0x11/0x81 等反馈首字节误当作电机 1 的 ID。失能反馈若与参数帧完全重合，
+                # 保守按参数类处理，不能用猜测的位置/速度更新反馈时间戳。
+                if CANID in (motor.MasterID, motor.SlaveID, 0, 0x7FF) and self.__pending_param_reply(data):
                     self._param_request = None
-                    self._param_guard_until = monotonic() + PARAM_REPLY_GUARD
                     self.__process_set_param_packet(data, CANID, CMD)
-                elif int(data[3]) <= PARAM_REPLY_RID_MAX or monotonic() <= self._param_guard_until:
-                    # data[3] 命中 RID（或保存标记）就丢弃，与到达时间无关；静止电机的状态帧
-                    # 速度≈0 → data[3]≈127，不满足该条件，因此不会被误丢。
-                    self.dropped_param_replies += 1
                 else:
-                    self.__process_packet(data, CANID, CMD)
+                    # 包括全部 RID 的迟到应答；永不回退成状态反馈。
+                    self.dropped_param_replies += 1
                 continue
             self.__process_packet(data, CANID, CMD)
 
@@ -403,21 +393,20 @@ class MotorControl:
         """保留官方函数名；接收与分发已统一到 recv()。"""
         self.recv()
 
-    def __expect_param_reply(self, slave_id, rid):
+    def __expect_param_reply(self, slave_id, rid, command):
         """登记一条参数类命令的待处理请求，供 recv() 判别应答归属。"""
         now = monotonic()
-        self._param_request = (slave_id, rid, now + PARAM_REPLY_TIMEOUT)
-        self._param_guard_until = now + PARAM_REPLY_TIMEOUT + PARAM_REPLY_GUARD
+        self._param_request = (slave_id, rid, command, now + PARAM_REPLY_TIMEOUT)
 
     def __pending_param_reply(self, data):
         """判断这一帧参数类应答是否属于最近发出的参数命令。"""
         request = self._param_request
-        if request is None or monotonic() > request[2]:
+        if request is None or monotonic() > request[3]:
             return False
-        slave_id, rid, _ = request
+        slave_id, rid, command, _ = request
         if ((int(data[1]) << 8) | int(data[0])) != slave_id:
             return False
-        return rid is None or int(data[3]) == rid
+        return int(data[2]) == command and (rid is None or int(data[3]) == rid)
 
     def __process_packet(self, data, CANID, CMD):
         if CMD == 0x11:
@@ -510,7 +499,7 @@ class MotorControl:
         can_id_h = (Motor.SlaveID >> 8)& 0xff  #id high 8 bits
         data_buf = np.array([np.uint8(can_id_l), np.uint8(can_id_h), 0x33, np.uint8(RID), 0x00, 0x00, 0x00, 0x00], np.uint8)
         self.__send_data(0x7FF, data_buf)
-        self.__expect_param_reply(Motor.SlaveID, RID)
+        self.__expect_param_reply(Motor.SlaveID, RID, 0x33)
 
     def __write_motor_param(self, Motor, RID, data):
         can_id_l = Motor.SlaveID & 0xff #id low 8 bits
@@ -523,7 +512,7 @@ class MotorControl:
             # data is int
             data_buf[4:8] = data_to_uint8s(int(data))
         self.__send_data(0x7FF, data_buf)
-        self.__expect_param_reply(Motor.SlaveID, RID)
+        self.__expect_param_reply(Motor.SlaveID, RID, 0x55)
 
     def switchControlMode(self, Motor, ControlMode):
         """
@@ -557,7 +546,7 @@ class MotorControl:
         data_buf = np.array([np.uint8(can_id_l), np.uint8(can_id_h), 0xAA, 0x00, 0x00, 0x00, 0x00, 0x00], np.uint8)
         self.disable(Motor)  # before save disable the motor
         self.__send_data(0x7FF, data_buf)
-        self.__expect_param_reply(Motor.SlaveID, None)  # 保存应答不带 RID
+        self.__expect_param_reply(Motor.SlaveID, None, 0xAA)  # 保存应答不带 RID
         sleep(0.001)
 
     def change_limit_param(self, Motor_Type, PMAX, VMAX, TMAX):
@@ -631,17 +620,16 @@ class MotorControl:
         tail = 0x55
         frame_length = 16
         i = 0
-        remainder_pos = 0
 
         while i <= len(data) - frame_length:
             if data[i] == header and data[i + frame_length - 1] == tail:
                 frame = data[i:i + frame_length]
                 frames.append(frame)
                 i += frame_length
-                remainder_pos = i
             else:
                 i += 1
-        self.data_save = data[remainder_pos:]
+        # i 之前的完整帧和无效前缀都已消费；只保留不足一帧的尾部（最多 15 字节）。
+        self.data_save = data[i:]
         return frames
 
 
