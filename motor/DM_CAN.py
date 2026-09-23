@@ -26,13 +26,27 @@
 状态只会在发送控制帧或调用 refresh_motor_status 后刷新到 Motor 对象。修改电机参数时应保持
 失能状态；模式修改后如需掉电保存，调用 save_motor_param。完整控制、参数读写和状态接口均在
 本文件的 MotorControl 类中。
+
+本文件是官方 u2can/DM_CAN.py 的副本，唯一实质改动是 recv()/recv_set_param_data() 的统一接收
+与分发：读(0x33)/写(0x55)/保存(0xAA)命令的应答不再可能被当成位置反馈解析。差异清单与官方依据见
+项目根目录 docs/官方依据.md。
 """
 
-from time import sleep
+from time import monotonic, sleep
 import numpy as np
 from enum import IntEnum
 from struct import unpack
 from struct import pack
+
+# 读(0x33) / 写(0x55) / 保存(0xAA) 命令应答的判别字节。官方 SocketCan 例程按同一组字节分发，
+# 并要求"最近发过参数类命令"（read_write_save）才解析，其中 0xAA 只清标志不取值：
+#   damiao/SDK/电机控制例程/SocketCan控制例程/C++例程/src/protocol/damiao.cpp
+PARAM_REPLY_MARKERS = (0x33, 0x55, 0xAA)
+# 待处理请求的有效期，覆盖 SDK 自身 20 × 0.05 s 的重试窗口。
+PARAM_REPLY_TIMEOUT = 1.0
+# 参数命令结束后的保护窗口：窗口内出现无主的参数类应答就丢弃（防止迟到的应答污染位置反馈），
+# 窗口外一律按反馈解析——否则静止电机的反馈帧只要位置低字节命中标记就会被永久丢弃。
+PARAM_REPLY_GUARD = 0.1
 
 class Motor:
     def __init__(self, MotorType, SlaveID, MasterID):
@@ -139,6 +153,10 @@ class MotorControl:
         self.serial_ = serial_device
         self.motors_map = dict()
         self.data_save = bytes()  # save data
+        self._param_request = None  # 待处理参数类请求 (slave_id, rid 或 None, 截止时间)
+        self._param_guard_until = 0.0  # 参数命令后的保护窗口截止时间
+        self.dropped_param_replies = 0  # 保护窗口内丢弃的无主参数类应答帧数
+        self.ignored_frames = 0  # CMD != 0x11 的适配器帧数（如 0xEE 通信错误）
         if self.serial_.is_open:  # open the serial port
             print("Serial port is open")
             serial_device.close()
@@ -348,24 +366,53 @@ class MotorControl:
         self.recv()  # receive the data from serial port
 
     def recv(self):
+        """唯一的接收入口：续上未拆完的缓存、拆帧，再按报文类别分发。"""
         # 把上次没有解析完的剩下的也放进来
         data_recv = b''.join([self.data_save, self.serial_.read_all()])
-        # print(data_recv)
         packets = self.__extract_packets(data_recv)
         for packet in packets:
             data = packet[7:15]
             CANID = (packet[6] << 24) | (packet[5] << 16) | (packet[4] << 8) | packet[3]
             CMD = packet[1]
+            if CMD != 0x11:
+                # 适配器级帧：0x00 心跳、0x02 发送失败、0xEE 通信错误等，不含电机状态
+                self.ignored_frames += 1
+                continue
+            if int(data[1]) == 0 and data[2] in PARAM_REPLY_MARKERS:
+                # 参数类应答：data[0..1] 是 slave id、data[2] 是读/写/保存标记，此时 data[1..2]
+                # 不是位置字节，绝不能按反馈帧解析。要求 data[1]==0（ID 均小于 0x100，官方
+                # C/C++ 例程也从 data[0..1] 取 ID），否则静止电机的反馈帧只要位置低字节命中标记
+                # 就会被持续丢弃，例如实测帧 data=11 71 AA 7F F8 00 21 1E（位置 -1.3998 rad）。
+                if self.__pending_param_reply(data):
+                    self._param_request = None
+                    self._param_guard_until = monotonic() + PARAM_REPLY_GUARD
+                    self.__process_set_param_packet(data, CANID, CMD)
+                elif monotonic() <= self._param_guard_until:
+                    self.dropped_param_replies += 1
+                else:
+                    self.__process_packet(data, CANID, CMD)
+                continue
             self.__process_packet(data, CANID, CMD)
 
     def recv_set_param_data(self):
-        data_recv = self.serial_.read_all()
-        packets = self.__extract_packets(data_recv)
-        for packet in packets:
-            data = packet[7:15]
-            CANID = (packet[6] << 24) | (packet[5] << 16) | (packet[4] << 8) | packet[3]
-            CMD = packet[1]
-            self.__process_set_param_packet(data, CANID, CMD)
+        """保留官方函数名；接收与分发已统一到 recv()。"""
+        self.recv()
+
+    def __expect_param_reply(self, slave_id, rid):
+        """登记一条参数类命令的待处理请求，供 recv() 判别应答归属。"""
+        now = monotonic()
+        self._param_request = (slave_id, rid, now + PARAM_REPLY_TIMEOUT)
+        self._param_guard_until = now + PARAM_REPLY_TIMEOUT + PARAM_REPLY_GUARD
+
+    def __pending_param_reply(self, data):
+        """判断这一帧参数类应答是否属于最近发出的参数命令。"""
+        request = self._param_request
+        if request is None or monotonic() > request[2]:
+            return False
+        slave_id, rid, _ = request
+        if ((int(data[1]) << 8) | int(data[0])) != slave_id:
+            return False
+        return rid is None or int(data[3]) == rid
 
     def __process_packet(self, data, CANID, CMD):
         if CMD == 0x11:
@@ -458,6 +505,7 @@ class MotorControl:
         can_id_h = (Motor.SlaveID >> 8)& 0xff  #id high 8 bits
         data_buf = np.array([np.uint8(can_id_l), np.uint8(can_id_h), 0x33, np.uint8(RID), 0x00, 0x00, 0x00, 0x00], np.uint8)
         self.__send_data(0x7FF, data_buf)
+        self.__expect_param_reply(Motor.SlaveID, RID)
 
     def __write_motor_param(self, Motor, RID, data):
         can_id_l = Motor.SlaveID & 0xff #id low 8 bits
@@ -470,6 +518,7 @@ class MotorControl:
             # data is int
             data_buf[4:8] = data_to_uint8s(int(data))
         self.__send_data(0x7FF, data_buf)
+        self.__expect_param_reply(Motor.SlaveID, RID)
 
     def switchControlMode(self, Motor, ControlMode):
         """
@@ -503,6 +552,7 @@ class MotorControl:
         data_buf = np.array([np.uint8(can_id_l), np.uint8(can_id_h), 0xAA, 0x00, 0x00, 0x00, 0x00, 0x00], np.uint8)
         self.disable(Motor)  # before save disable the motor
         self.__send_data(0x7FF, data_buf)
+        self.__expect_param_reply(Motor.SlaveID, None)  # 保存应答不带 RID
         sleep(0.001)
 
     def change_limit_param(self, Motor_Type, PMAX, VMAX, TMAX):
@@ -555,7 +605,7 @@ class MotorControl:
         read only the RID of the motor 读取电机的内部信息例如 版本号等
         :param Motor: Motor object 电机对象
         :param RID: DM_variable 电机参数
-        :return: 电机参数的值
+        :return: 电机参数的值；重试窗口 max_retries × retry_interval 内无应答则返回 None
         """
         max_retries = 20
         retry_interval = 0.05  #retry times
@@ -566,8 +616,6 @@ class MotorControl:
             if Motor.SlaveID in self.motors_map:
                 if RID in self.motors_map[Motor.SlaveID].temp_param_dict:
                     return self.motors_map[Motor.SlaveID].temp_param_dict[RID]
-                else:
-                    return None
         return None
 
     # -------------------------------------------------

@@ -1,96 +1,137 @@
-"""DM-J6006-2EC 官方 USB2CAN 控制示例。
+"""DM-J6006-2EC 多电机控制示例。
 
-运行前请确认：
-1. 已安装项目依赖：``python -m pip install -r requirements.txt``。
-2. USB2CAN 已连接，下面的 ``SERIAL_PORT`` 与设备管理器中的端口一致。
-3. 电机供电为 24-48 V，CAN 线连接正确，电机 Slave ID 为 1，Master ID 为 0x11。
-
-从项目根目录运行：
+运行前直接修改本文件顶部的“用户配置”区域，然后执行：
 
     python examples/DM_Motor_Example.py
 
-示例默认使用位置速度模式，让电机在小范围内往复运动。首次联调时建议先把
-``RUN_SECONDS`` 设为较小值，并准备好断电或停止电机的方式。
+示例只负责读取配置和调用 ``MotorManager``，电机创建、模式切换、
+参数修改、控制循环和串口清理都由 ``motor.motor_manager`` 负责。
 """
 
 from __future__ import annotations
 
-import math
-import time
+import sys
+from pathlib import Path
+from typing import Any, Dict, List
 
-import serial
+# 允许直接运行 `python examples/DM_Motor_Example.py`，无需先安装本项目。
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from motor.DM_CAN import Control_Type, DM_Motor_Type, DM_variable, Motor, MotorControl
+from motor import (
+    MITControl,
+    MotorConfig,
+    MotorManager,
+    PositionForceControl,
+    PositionVelocityControl,
+    RunConfig,
+    SineMotion,
+    VelocityControl,
+)
 
 
+# ============================ 用户配置 ============================
+
+# USB2CAN 串口。
 SERIAL_PORT = "COM5"
 SERIAL_BAUDRATE = 921600
-MOTOR_SLAVE_ID = 0x01
-MOTOR_MASTER_ID = 0x11
-RUN_SECONDS = 10.0
-CONTROL_PERIOD = 0.01
+SERIAL_TIMEOUT = 0.5
+
+RUN_SECONDS = 50.0       # 控制运行时间，单位 s
+CONTROL_PERIOD = 0.01   # 一轮所有电机的目标周期，单位 s；实际受通信耗时影响
+STATUS_INTERVAL = 0.25  # 状态打印间隔，单位 s
+FEEDBACK_TIMEOUT = 0.2  # 反馈超时，单位 s；超时即停止控制并失能全部
+
+# MIT：controlMIT
+MIT_PARAMS = MITControl(
+    kp=10,   # 0..500
+    kd=1.0,    # 0..5
+    q=0,    # 绝对位置 rad；None 取本轮开始时的反馈位置
+    dq=0.1,    # 期望速度 rad/s
+    tau=0,   # 前馈力矩 N·m
+)
+
+# 位置速度：control_Pos_Vel
+POSITION_VELOCITY_PARAMS = PositionVelocityControl(
+    P_desired=10,  # 绝对位置 rad；None 取本轮开始时的反馈位置
+    V_desired=2,  # 期望速度 rad/s
+)
+
+# 速度：control_Vel
+VELOCITY_PARAMS = VelocityControl(
+    Vel_desired=1  # rad/s，可为负
+) 
+
+# 力位混合：control_pos_force
+POSITION_FORCE_PARAMS = PositionForceControl(
+    Pos_des=None,  # 绝对位置 rad；None 取本轮开始时的反馈位置
+    Vel_des=100,   # SDK 原始整数：100 = 1 rad/s
+    i_des=3000,    # SDK 原始整数：3000 = 最大电流的 30%，不是 mA
+)
+
+# 只创建这里列出的电机；ID 可以不连续，最多 16 台。
+MOTOR_CONFIGS = (
+    MotorConfig(
+        slave_id=0x01,       # 0x00..0x0F
+        master_id=0x11,
+        control=MIT_PARAMS,  # 选择上面的参数类，也可在此新建独立参数对象
+        #motion=SineMotion(amplitude=0.10, frequency=0.5, phase=0.0),
+        motion=None,
+        # motion=None 时按 SDK 目标原样控制；速度模式必须用 None
+        damping=None,       # None 不写 Damp
+        save_parameters=False,
+    ),
+)
+
+
+def print_parameters(parameters: Dict[int, Dict[str, Any]]) -> None:
+    for slave_id, values in parameters.items():
+        print(f"电机 Slave=0x{slave_id:02X} 参数:")
+        for name, value in values.items():
+            print(f"  {name}: {value}")
+
+
+def print_status(statuses: List[Dict[str, Any]]) -> None:
+    for status in statuses:
+        age = status["age"]
+        age_text = "从未收到" if age is None else f"{age * 1000:.0f} ms 前"
+        print(
+            f"电机 Slave=0x{status['slave_id']:02X}: "
+            f"pos={status['position']: .3f} rad, "
+            f"vel={status['velocity']: .3f} rad/s, "
+            f"tau={status['torque']: .3f} N·m, "
+            f"状态={status['status_name']}(0x{status['error']:X}), "
+            f"反馈 {status['feedback_count']} 帧/最近 {age_text}"
+        )
 
 
 def main() -> None:
-    motor = Motor(
-        DM_Motor_Type.DM6006,  # DM-J6006-2EC
-        MOTOR_SLAVE_ID,
-        MOTOR_MASTER_ID,
+    run_config = RunConfig(
+        seconds=RUN_SECONDS,
+        period=CONTROL_PERIOD,
+        status_interval=STATUS_INTERVAL,
+        feedback_timeout=FEEDBACK_TIMEOUT,
     )
-    serial_device = serial.Serial(
+    manager = MotorManager.connect(
         SERIAL_PORT,
-        SERIAL_BAUDRATE,
-        timeout=0.5,
+        configs=MOTOR_CONFIGS,
+        baudrate=SERIAL_BAUDRATE,
+        timeout=SERIAL_TIMEOUT,
     )
-    control = MotorControl(serial_device)
-    control.addMotor(motor)
-
     try:
-        print(f"已连接 {SERIAL_PORT}，电机 ID=0x{MOTOR_SLAVE_ID:02X}")
+        print(f"已连接 {SERIAL_PORT}，共 {manager.motor_count} 个 DM-J6006-2EC")
+        manager.refresh_status()
+        print_parameters(manager.read_parameters())
 
-        # 官方函数发送查询后立即读取；USB2CAN 反馈可能稍后到达，因此补一次等待和读取。
-        control.refresh_motor_status(motor)
-        time.sleep(0.1)
-        control.recv()
-        print(f"当前反馈位置: {motor.getPosition():.3f} rad")
-
-        # 位置速度模式是 DM-J6006-2EC 支持的模式之一。
-        if control.switchControlMode(motor, Control_Type.POS_VEL):
-            print("已切换到位置速度模式")
-        else:
-            print("切换位置速度模式失败，请检查固件版本和电机参数")
-
-        print("减速比:", control.read_motor_param(motor, DM_variable.Gr))
-        print("位置范围: ±12.5 rad")
-        print("速度范围: ±45 rad/s")
-        print("扭矩范围: ±20 N·m")
-
-        # 修改参数前保持失能；完成参数设置后再使能。
-        control.enable(motor)
-        print("电机已使能，开始控制")
-
-        start = time.monotonic()
-        while time.monotonic() - start < RUN_SECONDS:
-            elapsed = time.monotonic() - start
-            target_position = 2.0 * math.sin(elapsed)
-            target_velocity = 2.0
-
-            # p_des 单位为 rad，v_des 单位为 rad/s。
-            control.control_Pos_Vel(motor, target_position, target_velocity)
-            print(
-                f"位置={motor.getPosition(): .3f} rad, "
-                f"速度={motor.getVelocity(): .3f} rad/s, "
-                f"扭矩={motor.getTorque(): .3f} N·m, "
-                f"故障=0x{motor.getError():X}"
-            )
-            time.sleep(CONTROL_PERIOD)
+        manager.configure()
+        manager.refresh_status()
+        manager.enable_all()
+        print_status(manager.status_snapshot())  # 使能后的实测反馈码，确认电机真的已使能
+        manager.run(run_config, on_status=print_status)
     except KeyboardInterrupt:
         print("收到停止信号")
     finally:
-        # 无论正常结束还是 Ctrl+C，都先让电机失能再关闭串口。
-        control.disable(motor)
-        serial_device.close()
-        print("电机已失能，串口已关闭")
+        manager.close()
+        print("所有电机已失能，串口已关闭")
 
 
 if __name__ == "__main__":
