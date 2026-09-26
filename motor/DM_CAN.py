@@ -11,17 +11,27 @@
 最小使用示例：
 
     import serial
-    from motor import DM_Motor_Type, Motor, MotorControl
+    from motor import Control_Type, DM_Motor_Type, Motor, MotorControl
 
     motor = Motor(DM_Motor_Type.DM6006, 0x01, 0x11)
     serial_device = serial.Serial("COM8", 921600, timeout=0.5)
-    control = MotorControl(serial_device)
-    control.addMotor(motor)
-    control.enable(motor)
-    control.controlMIT(motor, kp=20, kd=2, q=0, dq=0, tau=0)
-    print(motor.getPosition(), motor.getVelocity(), motor.getTorque())
-    control.disable(motor)
-    serial_device.close()
+    control = None
+    try:
+        control = MotorControl(serial_device)
+        control.addMotor(motor)
+        control.disable(motor)
+        control.sync_motor_limits(motor)
+        if not control.switchControlMode(motor, Control_Type.MIT):
+            raise RuntimeError("切换模式失败")
+        control.enable(motor)
+        control.controlMIT(motor, kp=20, kd=2, q=motor.getPosition(), dq=0, tau=0)
+        print(motor.getPosition(), motor.getVelocity(), motor.getTorque())
+    finally:
+        try:
+            if control is not None:
+                control.disable(motor)
+        finally:
+            serial_device.close()
 
 状态只会在发送控制帧或调用 refresh_motor_status 后刷新到 Motor 对象。修改电机参数时应保持
 失能状态；模式修改后如需掉电保存，调用 save_motor_param。完整控制、参数读写和状态接口均在
@@ -33,6 +43,7 @@
 """
 
 from time import monotonic, sleep
+import math
 import numpy as np
 from enum import IntEnum
 from struct import unpack
@@ -44,6 +55,17 @@ from struct import pack
 PARAM_REPLY_MARKERS = (0x33, 0x55, 0xAA)
 # 待处理请求的有效期，覆盖 SDK 自身 20 × 0.05 s 的重试窗口。
 PARAM_REPLY_TIMEOUT = 1.0
+STATUS_NAMES = {
+    0x00: "已失能", 0x01: "已使能", 0x08: "过压", 0x09: "欠压",
+    0x0A: "过流", 0x0B: "MOS 过温", 0x0C: "电机线圈过温",
+    0x0D: "通信丢失", 0x0E: "过载",
+}
+
+
+def _finite_values(**values):
+    for name, value in values.items():
+        if value is None or not math.isfinite(value):
+            raise ValueError(f"{name} 必须是有限数")
 
 class Motor:
     def __init__(self, MotorType, SlaveID, MasterID):
@@ -53,6 +75,11 @@ class Motor:
         :param SlaveID: CANID 电机ID
         :param MasterID: MasterID 主机ID 建议不要设为0
         """
+        for name, value in (("SlaveID", SlaveID), ("MasterID", MasterID)):
+            if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= 0x7FF:
+                raise ValueError(f"{name} 必须是 0..0x7FF 的整数")
+        if MasterID != 0 and SlaveID == MasterID:
+            raise ValueError("SlaveID 和 MasterID 不能相同")
         self.Pd = float(0)
         self.Vd = float(0)
         self.state_q = float(0)
@@ -61,16 +88,27 @@ class Motor:
         self.state_err = int(0)
         self.SlaveID = SlaveID
         self.MasterID = MasterID
-        self.MotorType = MotorType
+        self.MotorType = DM_Motor_Type(MotorType)
         self.isEnable = False
-        self.NowControlMode = Control_Type.MIT
+        self.NowControlMode = None  # 读取或切换成功后才能确认实际模式
         self.temp_param_dict = {}
+        self.feedback_count = 0
+        self.last_feedback_at = None
+        self.limits = None  # sync_motor_limits() 读回的 PMAX、VMAX、TMAX
 
     def recv_data(self, q: float, dq: float, tau: float, err: int):
         self.state_q = q
         self.state_dq = dq
         self.state_tau = tau
         self.state_err = err
+        if err != 0x01:
+            self.isEnable = False
+        self.feedback_count += 1
+        self.last_feedback_at = monotonic()
+
+    @property
+    def status_name(self):
+        return STATUS_NAMES.get(self.state_err, "未知状态")
 
     def getPosition(self):
         """
@@ -142,21 +180,98 @@ class MotorControl:
         [12.566,  50,   5],  # DM3507
     ]
 
-    def __init__(self, serial_device):
+    def __init__(self, serial_device, *, feedback_timeout=0.2):
         """
         define MotorControl object 定义电机控制对象
         :param serial_device: serial object 串口对象
         """
+        _finite_values(feedback_timeout=feedback_timeout)
+        if feedback_timeout <= 0:
+            raise ValueError("feedback_timeout 必须大于 0")
+        self.feedback_timeout = feedback_timeout
         self.serial_ = serial_device
+        self.Limit_Param = [list(values) for values in type(self).Limit_Param]
         self.motors_map = dict()
         self.data_save = bytes()  # save data
         self._param_request = None  # (slave_id, rid 或 None, 命令字, 截止时间)
         self.dropped_param_replies = 0  # 未匹配请求或存在歧义的参数类帧数
         self.ignored_frames = 0  # CMD != 0x11 的适配器帧数（如 0xEE 通信错误）
-        if self.serial_.is_open:  # open the serial port
-            print("Serial port is open")
-            serial_device.close()
-        self.serial_.open()
+        if not self.serial_.is_open:
+            self.serial_.open()
+
+    @property
+    def motors(self):
+        """返回已注册电机，Slave/Master 两个映射只计一次。"""
+        return tuple(dict.fromkeys(self.motors_map.values()))
+
+    def _require_motor(self, motor):
+        if self.motors_map.get(motor.SlaveID) is not motor:
+            raise ValueError("电机未注册到当前 MotorControl")
+
+    def sync_motor_limits(self, motor):
+        """读回实际量程并对齐编解码表；控制前调用一次。"""
+        self._require_motor(motor)
+        motor.limits = None
+        values = []
+        for rid in (DM_variable.PMAX, DM_variable.VMAX, DM_variable.TMAX):
+            value = self.read_motor_param(motor, rid)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+                raise RuntimeError(f"电机 0x{motor.SlaveID:02X} 的 {rid.name} 读取失败：{value!r}")
+            values.append(float(value))
+        for other in self.motors:
+            if other.MotorType == motor.MotorType and other.limits is not None:
+                if not all(math.isclose(a, b, rel_tol=1e-6, abs_tol=1e-6) for a, b in zip(values, other.limits)):
+                    raise RuntimeError("同型号电机的实际量程不一致，无法共用编解码表")
+        self.change_limit_param(motor.MotorType, *values)
+        motor.limits = tuple(values)
+        return motor.limits
+
+    def refresh_status(self, wait=0.1):
+        """批量查询全部电机并确认新反馈；用于启动，不用于每周期等待。"""
+        _finite_values(wait=wait)
+        if wait < 0:
+            raise ValueError("wait 不能为负")
+        self.recv()
+        before = {motor: motor.feedback_count for motor in self.motors}
+        for motor in before:
+            self.refresh_motor_status(motor)
+        sleep(wait)
+        self.recv()
+        for motor, count in before.items():
+            if motor.feedback_count == count:
+                raise RuntimeError(f"电机 0x{motor.SlaveID:02X} 查询后没有收到新反馈")
+
+    def check_status(self, motor=None):
+        """检查一个或全部电机的新鲜度和已使能状态；异常由调用方 finally 清理。"""
+        motors = self.motors if motor is None else (motor,)
+        for item in motors:
+            self._require_motor(item)
+        self.recv()
+        now = monotonic()
+        for item in motors:
+            if item.last_feedback_at is None:
+                raise RuntimeError(f"电机 0x{item.SlaveID:02X} 从未收到反馈")
+            if now - item.last_feedback_at > self.feedback_timeout:
+                raise RuntimeError(f"电机 0x{item.SlaveID:02X} 反馈超时")
+            if item.getError() != 0x01:
+                raise RuntimeError(
+                    f"电机 0x{item.SlaveID:02X} 状态 0x{item.getError():X}（{item.status_name}），未使能或故障"
+                )
+
+    def _check_command(self, motor, mode):
+        self._require_motor(motor)
+        if motor.NowControlMode != mode:
+            raise RuntimeError("控制模式未确认或与指令不一致，请先 switchControlMode()")
+        if motor.limits is None:
+            raise RuntimeError("请先 sync_motor_limits() 读取实际量程")
+        self.check_status(motor)
+        if not motor.isEnable:
+            raise RuntimeError("请先调用 enable() 确认使能")
+
+    def _check_position(self, motor, value, name):
+        _finite_values(**{name: value})
+        if abs(value) > motor.limits[0]:
+            raise ValueError(f"{name}={value} 超出电机实际位置量程 ±{motor.limits[0]}")
 
     def controlMIT(self, DM_Motor, kp: float, kd: float, q: float, dq: float, tau: float):
         """
@@ -169,9 +284,11 @@ class MotorControl:
         :param tau: torque  期望力矩
         :return: None
         """
-        if DM_Motor.SlaveID not in self.motors_map:
-            print("controlMIT ERROR : Motor ID not found")
-            return
+        self._check_command(DM_Motor, Control_Type.MIT)
+        _finite_values(kp=kp, kd=kd, dq=dq, tau=tau)
+        if not 0 <= kp <= 500 or not 0 <= kd <= 5:
+            raise ValueError("MIT 的 kp 必须在 0..500，kd 必须在 0..5")
+        self._check_position(DM_Motor, q, "q")
         kp_uint = float_to_uint(kp, 0, 500, 12)
         kd_uint = float_to_uint(kd, 0, 5, 12)
         MotorType = DM_Motor.MotorType
@@ -191,7 +308,7 @@ class MotorControl:
         data_buf[6] = ((kd_uint & 0xf) << 4) | ((tau_uint >> 8) & 0xf)
         data_buf[7] = tau_uint & 0xff
         self.__send_data(DM_Motor.SlaveID, data_buf)
-        self.recv()  # receive the data from serial port
+        self.check_status(DM_Motor)
 
     def control_delay(self, DM_Motor, kp: float, kd: float, q: float, dq: float, tau: float, delay: float):
         """
@@ -204,6 +321,9 @@ class MotorControl:
         :param tau: torque  期望力矩
         :param delay: delay time 延迟时间 单位秒
         """
+        _finite_values(delay=delay)
+        if delay < 0:
+            raise ValueError("delay 不能为负")
         self.controlMIT(DM_Motor, kp, kd, q, dq, tau)
         sleep(delay)
 
@@ -215,9 +335,9 @@ class MotorControl:
         :param V_desired: desired velocity 期望速度
         :return: None
         """
-        if Motor.SlaveID not in self.motors_map:
-            print("Control Pos_Vel Error : Motor ID not found")
-            return
+        self._check_command(Motor, Control_Type.POS_VEL)
+        self._check_position(Motor, P_desired, "P_desired")
+        _finite_values(V_desired=V_desired)
         motorid = 0x100 + Motor.SlaveID
         data_buf = np.array([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], np.uint8)
         P_desired_uint8s = float_to_uint8s(P_desired)
@@ -226,7 +346,7 @@ class MotorControl:
         data_buf[4:8] = V_desired_uint8s
         self.__send_data(motorid, data_buf)
         sleep(0.001)
-        self.recv()  # receive the data from serial port
+        self.check_status(Motor)
 
     def control_Vel(self, Motor, Vel_desired):
         """
@@ -234,15 +354,14 @@ class MotorControl:
         :param Motor: Motor object 电机对象
         :param Vel_desired: desired velocity 期望速度
         """
-        if Motor.SlaveID not in self.motors_map:
-            print("control_VEL ERROR : Motor ID not found")
-            return
+        self._check_command(Motor, Control_Type.VEL)
+        _finite_values(Vel_desired=Vel_desired)
         motorid = 0x200 + Motor.SlaveID
         data_buf = np.array([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], np.uint8)
         Vel_desired_uint8s = float_to_uint8s(Vel_desired)
         data_buf[0:4] = Vel_desired_uint8s
         self.__send_data(motorid, data_buf)
-        self.recv()  # receive the data from serial port
+        self.check_status(Motor)
 
     def control_pos_force(self, Motor, Pos_des: float, Vel_des, i_des):
         """
@@ -252,9 +371,13 @@ class MotorControl:
         :param i_des: desired current rang 0-10000 期望电流标幺值放大10000倍
         电流标幺值：实际电流值除以最大电流值，最大电流见上电打印
         """
-        if Motor.SlaveID not in self.motors_map:
-            print("control_pos_vel ERROR : Motor ID not found")
-            return
+        self._check_command(Motor, Control_Type.Torque_Pos)
+        self._check_position(Motor, Pos_des, "Pos_des")
+        for name, value, upper in (("Vel_des", Vel_des, 0xFFFF), ("i_des", i_des, 10000)):
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(f"{name} 必须使用 SDK 的整数编码值")
+            if not 0 <= value <= upper:
+                raise ValueError(f"{name} 必须在 0..{upper}")
         motorid = 0x300 + Motor.SlaveID
         data_buf = np.array([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], np.uint8)
         Pos_desired_uint8s = float_to_uint8s(Pos_des)
@@ -266,7 +389,7 @@ class MotorControl:
         data_buf[6] = ides_uint & 0xff
         data_buf[7] = ides_uint >> 8
         self.__send_data(motorid, data_buf)
-        self.recv()  # receive the data from serial port
+        self.check_status(Motor)
 
     def control_Pos_Vel_CSP(self, Motor, P_desired: float, V_desired: float):#谐波JH11电机有这个模式
         """
@@ -276,9 +399,9 @@ class MotorControl:
         :param V_desired: desired velocity 期望速度
         :return: None
         """
-        if Motor.SlaveID not in self.motors_map:
-            print("Control Pos_Vel Error : Motor ID not found")
-            return
+        self._check_command(Motor, Control_Type.POS_VEL_CSP)
+        self._check_position(Motor, P_desired, "P_desired")
+        _finite_values(V_desired=V_desired)
         motorid = 0x400 + Motor.SlaveID
         data_buf = np.array([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], np.uint8)
         P_desired_uint8s = float_to_uint8s(P_desired)
@@ -287,7 +410,7 @@ class MotorControl:
         data_buf[4:8] = V_desired_uint8s
         self.__send_data(motorid, data_buf)
         # time.sleep(0.001)
-        self.recv()  # receive the data from serial port
+        self.check_status(Motor)
 
     def control_Vel_CSP(self, Motor, Vel_desired):#谐波JH11电机有这个模式
         """
@@ -295,15 +418,14 @@ class MotorControl:
         :param Motor: Motor object 电机对象
         :param Vel_desired: desired velocity 期望速度
         """
-        if Motor.SlaveID not in self.motors_map:
-            print("control_VEL ERROR : Motor ID not found")
-            return
+        self._check_command(Motor, Control_Type.VEL_CSP)
+        _finite_values(Vel_desired=Vel_desired)
         motorid = 0x500 + Motor.SlaveID
         data_buf = np.array([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], np.uint8)
         Vel_desired_uint8s = float_to_uint8s(Vel_desired)
         data_buf[0:4] = Vel_desired_uint8s
         self.__send_data(motorid, data_buf)
-        self.recv()  # receive the data from serial port
+        self.check_status(Motor)
 
     def control_Tor_CSP(self, Motor, Tor_desired):#谐波JH11电机有这个模式
         """
@@ -311,15 +433,14 @@ class MotorControl:
         :param Motor: Motor object 电机对象
         :param Vel_desired: desired velocity 期望速度
         """
-        if Motor.SlaveID not in self.motors_map:
-            print("control_VEL ERROR : Motor ID not found")
-            return
+        self._check_command(Motor, Control_Type.Torque_CSP)
+        _finite_values(Tor_desired=Tor_desired)
         motorid = 0x600 + Motor.SlaveID
         data_buf = np.array([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], np.uint8)
         Tor_desired_uint8s = float_to_uint8s(Tor_desired)
         data_buf[0:4] = Tor_desired_uint8s
         self.__send_data(motorid, data_buf)
-        self.recv()  # receive the data from serial port
+        self.check_status(Motor)
 
     def enable(self, Motor):
         """
@@ -327,9 +448,28 @@ class MotorControl:
         最好在上电后几秒后再使能电机
         :param Motor: Motor object 电机对象
         """
-        self.__control_cmd(Motor, np.uint8(0xFC))
-        sleep(0.1)
-        self.recv()  # receive the data from serial port
+        self._require_motor(Motor)
+        try:
+            self.recv()  # 消费滞留反馈，再建立本次查询的基线。
+            before = Motor.feedback_count
+            self.refresh_motor_status(Motor)
+            sleep(0.1)
+            self.recv()
+            if Motor.feedback_count == before:
+                raise RuntimeError("使能前查询没有收到新反馈")
+            if Motor.getError() not in (0x00, 0x01):
+                raise RuntimeError(f"使能前状态异常：{Motor.status_name}")
+            before = Motor.feedback_count
+            self.__control_cmd(Motor, np.uint8(0xFC))
+            sleep(0.1)
+            self.recv()
+            if Motor.feedback_count == before:
+                raise RuntimeError("使能后没有收到新反馈")
+            self.check_status(Motor)
+            Motor.isEnable = True
+        except BaseException:
+            self.disable(Motor)
+            raise
 
     def enable_old(self, Motor ,ControlMode):
         """
@@ -338,17 +478,32 @@ class MotorControl:
         最好在上电后几秒后再使能电机
         :param Motor: Motor object 电机对象
         """
-        data_buf = np.array([0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfc], np.uint8)
-        enable_id = ((int(ControlMode)-1) << 2) + Motor.SlaveID
-        self.__send_data(enable_id, data_buf)
-        sleep(0.1)
-        self.recv()  # receive the data from serial port
+        self._require_motor(Motor)
+        ControlMode = Control_Type(ControlMode)
+        try:
+            self.recv()
+            before = Motor.feedback_count
+            data_buf = np.array([0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfc], np.uint8)
+            enable_id = ((int(ControlMode)-1) << 2) + Motor.SlaveID
+            self.__send_data(enable_id, data_buf)
+            sleep(0.1)
+            self.recv()  # receive the data from serial port
+            if Motor.feedback_count == before:
+                raise RuntimeError("使能后没有收到新反馈")
+            self.check_status(Motor)
+            Motor.NowControlMode = ControlMode
+            Motor.isEnable = True
+        except BaseException:
+            self.disable(Motor)
+            raise
 
     def disable(self, Motor):
         """
         disable motor 失能电机
         :param Motor: Motor object 电机对象
         """
+        self._require_motor(Motor)
+        Motor.isEnable = False
         self.__control_cmd(Motor, np.uint8(0xFD))
         sleep(0.01)
 
@@ -471,12 +626,18 @@ class MotorControl:
         add motor to the motor control object 添加电机到电机控制对象
         :param Motor: Motor object 电机对象
         """
+        ids = {Motor.SlaveID}
+        if Motor.MasterID != 0:
+            ids.add(Motor.MasterID)
+        if any(key in self.motors_map and self.motors_map[key] is not Motor for key in ids):
+            raise ValueError("电机 Slave/Master ID 重复或交叉占用")
         self.motors_map[Motor.SlaveID] = Motor
         if Motor.MasterID != 0:
             self.motors_map[Motor.MasterID] = Motor
         return True
 
     def __control_cmd(self, Motor, cmd: np.uint8):
+        self._require_motor(Motor)
         data_buf = np.array([0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, cmd], np.uint8)
         self.__send_data(Motor.SlaveID, data_buf)
 
@@ -520,6 +681,11 @@ class MotorControl:
         :param Motor: Motor object 电机对象
         :param ControlMode: Control_Type 电机控制模式 example:MIT:Control_Type.MIT MIT模式
         """
+        self._require_motor(Motor)
+        ControlMode = Control_Type(ControlMode)
+        self.recv()
+        Motor.NowControlMode = None
+        Motor.temp_param_dict.pop(DM_variable.CTRL_MODE, None)
         max_retries = 10
         retry_interval = 0.05  #retry times
         RID = 10
@@ -530,6 +696,7 @@ class MotorControl:
             if Motor.SlaveID in self.motors_map:
                 if RID in self.motors_map[Motor.SlaveID].temp_param_dict:
                     if self.motors_map[Motor.SlaveID].temp_param_dict[RID] == ControlMode:
+                        Motor.NowControlMode = ControlMode
                         return True
                     else:
                         return False
@@ -558,6 +725,14 @@ class MotorControl:
         :param TMAX: 电机的TMAX
         :return:
         """
+        _finite_values(PMAX=PMAX, VMAX=VMAX, TMAX=TMAX)
+        if min(PMAX, VMAX, TMAX) <= 0:
+            raise ValueError("PMAX/VMAX/TMAX 必须大于 0")
+        if not all(math.isclose(a, b, rel_tol=1e-6, abs_tol=1e-6)
+                   for a, b in zip(self.Limit_Param[Motor_Type], (PMAX, VMAX, TMAX))):
+            for motor in self.motors:
+                if motor.MotorType == Motor_Type:
+                    motor.limits = None
         self.Limit_Param[Motor_Type][0] = PMAX
         self.Limit_Param[Motor_Type][1] = VMAX
         self.Limit_Param[Motor_Type][2] = TMAX
@@ -566,6 +741,7 @@ class MotorControl:
         """
         get the motor status 获得电机状态
         """
+        self._require_motor(Motor)
         can_id_l = Motor.SlaveID & 0xff #id low 8 bits
         can_id_h = (Motor.SlaveID >> 8) & 0xff  #id high 8 bits
         data_buf = np.array([np.uint8(can_id_l), np.uint8(can_id_h), 0xCC, 0x00, 0x00, 0x00, 0x00, 0x00], np.uint8)
@@ -580,6 +756,14 @@ class MotorControl:
         :param data: 电机参数的值
         :return: True or False ,True means success, False means fail
         """
+        self._require_motor(Motor)
+        self.recv()
+        Motor.temp_param_dict.pop(RID, None)
+        if RID in (DM_variable.PMAX, DM_variable.VMAX, DM_variable.TMAX):
+            Motor.limits = None  # 写入结果不确定时也不能继续使用旧量程。
+        if RID == DM_variable.CTRL_MODE:
+            data = Control_Type(data)
+            Motor.NowControlMode = None
         max_retries = 20
         retry_interval = 0.05  #retry times
 
@@ -588,6 +772,8 @@ class MotorControl:
             self.recv_set_param_data()
             if Motor.SlaveID in self.motors_map and RID in self.motors_map[Motor.SlaveID].temp_param_dict:
                 if abs(self.motors_map[Motor.SlaveID].temp_param_dict[RID] - data) < 0.1:
+                    if RID == DM_variable.CTRL_MODE:
+                        Motor.NowControlMode = data
                     return True
                 else:
                     return False
@@ -601,6 +787,11 @@ class MotorControl:
         :param RID: DM_variable 电机参数
         :return: 电机参数的值；重试窗口 max_retries × retry_interval 内无应答则返回 None
         """
+        self._require_motor(Motor)
+        self.recv()
+        Motor.temp_param_dict.pop(RID, None)
+        if RID == DM_variable.CTRL_MODE:
+            Motor.NowControlMode = None
         max_retries = 20
         retry_interval = 0.05  #retry times
         self.__read_RID_param(Motor, RID)
@@ -609,7 +800,10 @@ class MotorControl:
             self.recv_set_param_data()
             if Motor.SlaveID in self.motors_map:
                 if RID in self.motors_map[Motor.SlaveID].temp_param_dict:
-                    return self.motors_map[Motor.SlaveID].temp_param_dict[RID]
+                    value = self.motors_map[Motor.SlaveID].temp_param_dict[RID]
+                    if RID == DM_variable.CTRL_MODE:
+                        Motor.NowControlMode = value
+                    return value
         return None
 
     # -------------------------------------------------

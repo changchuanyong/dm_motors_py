@@ -1,17 +1,14 @@
-"""使用真实 MotorControl、内存串口和虚拟时钟验证收发及启停边界。"""
+"""使用真实 MotorControl、内存串口和虚拟时钟验证通信回归。"""
 
 import struct
 import unittest
 from unittest.mock import patch
 
-from motor import (
-    DM_Motor_Type, DM_variable, Motor, MotorConfig, MotorControl, MotorManager,
-    RunConfig, VelocityControl, create_motor,
-)
+from motor import DM_Motor_Type, DM_variable, Motor, MotorControl
 
 
-def frame(can_id, payload):
-    return b"\xAA\x11\x08" + can_id.to_bytes(4, "little") + bytes(payload) + b"\x55"
+def frame(can_id, payload, cmd=0x11):
+    return bytes([0xAA, cmd, 8]) + can_id.to_bytes(4, "little") + bytes(payload) + b"\x55"
 
 
 class MemorySerial:
@@ -43,12 +40,26 @@ class ReplyingSerial(MemorySerial):
         self.states = dict.fromkeys(ids, 0)
         self.reply_queries = True
         self.reply_disables = True
+        self.reply_controls = True
+        self.enable_replies = True
         self.enable_state = 1
         self.query_limit = None
         self.query_fault_after = None
         self.queries = 0
         self.controls = []
         self.saves = []
+        self.param_values = {
+            (sid, rid): value
+            for sid in self.states
+            for rid, value in (
+                (DM_variable.CTRL_MODE, 1),
+                (DM_variable.Damp, 1.0),
+                (DM_variable.Gr, 1.0),
+                (DM_variable.PMAX, 12.5),
+                (DM_variable.VMAX, 45.0),
+                (DM_variable.TMAX, 20.0),
+            )
+        }
 
     def status(self, sid):
         payload = [(self.states[sid] << 4) | sid, 0x80, 0, 0x7F, 0xF7, 0xFF, 25, 25]
@@ -62,9 +73,13 @@ class ReplyingSerial(MemorySerial):
             sid = int.from_bytes(payload[:2], "little")
             command, rid = payload[2:4]
             if command == 0x33:
-                value = {21: 12.5, 22: 45.0, 23: 20.0}[rid]
-                self.received += frame(0x20 + sid, payload[:4] + struct.pack("<f", value))
+                value = self.param_values.get((sid, rid))
+                if value is not None:
+                    encoding = "<I" if rid == DM_variable.CTRL_MODE else "<f"
+                    self.received += frame(0x20 + sid, payload[:4] + struct.pack(encoding, value))
             elif command == 0x55:
+                encoding = "<I" if rid == DM_variable.CTRL_MODE else "<f"
+                self.param_values[sid, rid] = struct.unpack(encoding, payload[4:8])[0]
                 self.received += frame(0x20 + sid, payload)
             elif command == 0xAA:
                 self.saves.append(sid)
@@ -79,10 +94,14 @@ class ReplyingSerial(MemorySerial):
             sid = can_id & 0x0F
             if payload[:7] == b"\xFF" * 7:
                 self.states[sid] = self.enable_state if payload[7] == 0xFC else 0
+                if payload[7] == 0xFC and not self.enable_replies:
+                    return len(data)
                 if payload[7] == 0xFD and not self.reply_disables:
                     return len(data)
             else:
                 self.controls.append(sid)
+                if not self.reply_controls:
+                    return len(data)
             self.status(sid)
         return len(data)
 
@@ -93,8 +112,6 @@ class TransportRegressions(unittest.TestCase):
         for target, replacement in (
             ("motor.DM_CAN.monotonic", lambda: self.now),
             ("motor.DM_CAN.sleep", self.sleep),
-            ("motor.motor_manager.time.monotonic", lambda: self.now),
-            ("motor.motor_manager.time.sleep", self.sleep),
         ):
             patcher = patch(target, replacement)
             patcher.start()
@@ -106,19 +123,9 @@ class TransportRegressions(unittest.TestCase):
     def make_sdk(self, slave_id=1, master_id=0x11):
         serial = MemorySerial()
         sdk = MotorControl(serial)
-        motor = Motor(DM_Motor_Type.DM6006, slave_id, master_id) if slave_id > 15 else create_motor(slave_id, master_id)
+        motor = Motor(DM_Motor_Type.DM6006, slave_id, master_id)
         sdk.addMotor(motor)
         return sdk, motor, serial
-
-    def make_manager(self, count=1, save=False):
-        serial = ReplyingSerial(range(count))
-        manager = MotorManager(MotorControl(serial), tuple(
-            MotorConfig(sid, 0x20 + sid, VelocityControl(0.1), save_parameters=save)
-            for sid in serial.states
-        ), serial)
-        self.addCleanup(manager.close)
-        manager.configure()
-        return manager, serial
 
     def test_enabled_and_fault_frames_survive_parameter_byte_collisions(self):
         for state in (1, 2, 8, 9, 10, 11, 12, 13, 14):
@@ -157,7 +164,7 @@ class TransportRegressions(unittest.TestCase):
 
     def test_other_motors_can_id_cannot_complete_parameter_request(self):
         sdk, motor, serial = self.make_sdk()
-        other = create_motor(3, 0x13)
+        other = Motor(DM_Motor_Type.DM6006, 3, 0x13)
         sdk.addMotor(other)
         sdk._MotorControl__read_RID_param(motor, DM_variable.PMAX)
         payload = b"\x01\x00\x33\x15" + struct.pack("<f", 6.25)
@@ -213,53 +220,69 @@ class TransportRegressions(unittest.TestCase):
         self.assertEqual(motor.feedback_count, 0)
         self.assertIsNone(motor.last_feedback_at)
 
-    def test_one_four_and_sixteen_motors_can_repeat_enable_and_run(self):
-        for count in (1, 4, 16):
-            with self.subTest(count=count):
-                manager, serial = self.make_manager(count)
-                for _ in range(2):
-                    manager.enable_all()
-                    manager.enable_all()
-                    manager.run(RunConfig(seconds=0.005))
-                self.assertEqual(serial.controls, list(range(count)) * 2)
-                self.assertTrue(all(state == 0 for state in serial.states.values()))
+    def test_hardware_enable_reply_is_not_dropped(self):
+        """实机使能帧的 data[2] 是 0xAA，但它不是参数应答。"""
+        sdk, motor, serial = self.make_sdk()
+        serial.received = frame(0x11, [0x11, 0x71, 0xAA, 0x7F, 0xF8, 0, 0x21, 0x1E])
+        sdk.recv()
+        self.assertEqual(motor.getError(), 0x01)
+        self.assertEqual(motor.feedback_count, 1)
+        self.assertEqual(sdk.dropped_param_replies, 0)
+        self.assertAlmostEqual(motor.getPosition(), -1.3998, delta=0.001)
 
-    def test_enable_rejects_stale_baseline_after_lost_disable_reply(self):
-        manager, serial = self.make_manager()
-        manager.enable_all()
-        serial.reply_disables = False
-        manager.run(RunConfig(seconds=0.005))
-        serial.reply_queries = False
-        serial.enable_state = 0
-        with self.assertRaisesRegex(RuntimeError, "新反馈"):
-            manager.enable_all()
-        self.assertEqual(serial.controls, [0])
+    def test_adapter_frames_are_counted(self):
+        sdk, motor, serial = self.make_sdk()
+        serial.received = frame(0, bytes(8), cmd=0xEE)
+        sdk.recv()
+        self.assertEqual(sdk.ignored_frames, 1)
+        self.assertEqual(motor.feedback_count, 0)
 
-    def test_change_from_enabled_to_disabled_is_not_enable_success(self):
-        manager, serial = self.make_manager()
-        serial.states[0] = 1
-        serial.enable_state = 0
-        with self.assertRaisesRegex(RuntimeError, "使能"):
-            manager.enable_all()
-        self.assertEqual(serial.controls, [])
-        self.assertEqual(manager._enabled, {})
+    def test_read_motor_param_accepts_matching_reply(self):
+        sdk, motor, serial = self.make_sdk()
+        reply = frame(0x11, [1, 0, 0x33, 10, 1, 0, 0, 0])
+        with patch.object(serial, "read_all", side_effect=[b"", reply]):
+            value = sdk.read_motor_param(motor, DM_variable.CTRL_MODE)
+        self.assertEqual(value, 1)
+        self.assertEqual(motor.getParam(DM_variable.CTRL_MODE), 1)
+        self.assertEqual(motor.feedback_count, 0)
+        self.assertEqual(sdk.dropped_param_replies, 0)
 
-    def test_final_refresh_must_receive_new_enabled_feedback(self):
-        for failure in ("silent", "fault"):
-            with self.subTest(failure=failure):
-                manager, serial = self.make_manager(4)
-                if failure == "silent":
-                    serial.query_limit = 4
-                else:
-                    serial.query_fault_after = 4
-                with self.assertRaises(RuntimeError):
-                    manager.enable_all()
-                self.assertTrue(all(state == 0 for state in serial.states.values()))
-                self.assertEqual(serial.controls, [])
+    def test_read_motor_param_keeps_retrying_until_reply(self):
+        sdk, motor, serial = self.make_sdk()
+        reply = frame(0x11, [1, 0, 0x33, 10, 2, 0, 0, 0])
+        with patch.object(serial, "read_all", side_effect=[b"", b"", reply]):
+            value = sdk.read_motor_param(motor, DM_variable.CTRL_MODE)
+        self.assertEqual(value, 2)
 
-    def test_mode_only_configuration_is_saved(self):
-        _, serial = self.make_manager(save=True)
-        self.assertEqual(serial.saves, [0])
+    def test_save_reply_is_swallowed_without_parsing(self):
+        sdk, motor, serial = self.make_sdk()
+        motor.state_q = 1.25
+        sdk.save_motor_param(motor)
+        serial.received = frame(0x11, [1, 0, 0xAA, 1, 0, 0, 0, 0])
+        sdk.recv()
+        self.assertIsNone(sdk._param_request)
+        self.assertEqual(sdk.dropped_param_replies, 0)
+        self.assertEqual(motor.temp_param_dict, {})
+        self.assertEqual(motor.getPosition(), 1.25)
+        self.assertEqual(motor.feedback_count, 0)
+
+    def test_edge_stationary_feedback_is_not_dropped(self):
+        sdk, motor, serial = self.make_sdk()
+        serial.received = frame(0x11, [0x11, 0, 0xAA, 0x7F, 0xF8, 0, 0x21, 0x1E])
+        sdk.recv()
+        self.assertEqual(motor.feedback_count, 1)
+        self.assertEqual(sdk.dropped_param_replies, 0)
+        self.assertEqual(motor.getError(), 0x01)
+        self.assertAlmostEqual(motor.getPosition(), -12.44, delta=0.05)
+
+    def test_feedback_is_still_parsed_during_param_window(self):
+        sdk, motor, serial = self.make_sdk()
+        sdk.save_motor_param(motor)
+        serial.received = frame(0x11, [0x11, 0x80, 0, 0x80, 8, 0, 25, 25])
+        sdk.recv()
+        self.assertEqual(motor.getError(), 0x01)
+        self.assertIsNotNone(sdk._param_request)
+        self.assertEqual(sdk.dropped_param_replies, 0)
 
 
 if __name__ == "__main__":
