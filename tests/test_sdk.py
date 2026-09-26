@@ -88,7 +88,11 @@ class SDKTests(unittest.TestCase):
         self.assertEqual(tuple(sdk.Limit_Param[DM_Motor_Type.DM6006]), first.limits)
 
     def test_limit_changes_invalidate_previously_measured_limits(self):
-        for rid, value in ((DM_variable.PMAX, 6.25), (DM_variable.VMAX, 30.0), (DM_variable.TMAX, 10.0)):
+        for rid, value in (
+            (DM_variable.PMAX, 6.25),
+            (DM_variable.VMAX, 30.0),
+            (DM_variable.TMAX, 10.0),
+        ):
             for replies in (True, False):
                 with self.subTest(rid=rid, replies=replies):
                     sdk, motor, port = self.make_sdk()
@@ -113,37 +117,86 @@ class SDKTests(unittest.TestCase):
 
     def test_four_modes_encode_updated_numeric_targets(self):
         cases = (
-            (Control_Type.MIT, "controlMIT", 0,
-             ((500, 0, 0, 100, -100), (0, 5, 12.5, -100, 100)),
-             (b"\x7F\xFF\xFF\xFF\xFF\x00\x00\x00", b"\xFF\xFF\x00\x00\x00\xFF\xFF\xFF")),
-            (Control_Type.POS_VEL, "control_Pos_Vel", 0x100,
-             ((0.25, 0.5), (-0.5, 1.25)),
-             (struct.pack("<ff", 0.25, 0.5), struct.pack("<ff", -0.5, 1.25))),
-            (Control_Type.VEL, "control_Vel", 0x200,
-             ((0.25,), (-0.5,)),
-             (struct.pack("<fI", 0.25, 0), struct.pack("<fI", -0.5, 0))),
-            (Control_Type.Torque_Pos, "control_pos_force", 0x300,
-             ((0.25, 100, 3000), (-0.5, 65535, 10000)),
-             (struct.pack("<fHH", 0.25, 100, 3000), struct.pack("<fHH", -0.5, 65535, 10000))),
+            (
+                Control_Type.MIT,
+                "controlMIT",
+                0,
+                ((500, 0, 0, 100, -100), (0, 5, 12.5, -100, 100)),
+                (
+                    b"\x7F\xFF\xFF\xFF\xFF\x00\x00\x00",
+                    b"\xFF\xFF\x00\x00\x00\xFF\xFF\xFF",
+                ),
+            ),
+            (
+                Control_Type.POS_VEL,
+                "control_Pos_Vel",
+                0x100,
+                ((0.25, 0.5), (-0.5, 1.25)),
+                (struct.pack("<ff", 0.25, 0.5), struct.pack("<ff", -0.5, 1.25)),
+            ),
+            (
+                Control_Type.VEL,
+                "control_Vel",
+                0x200,
+                ((0.25,), (-0.5,)),
+                (struct.pack("<fI", 0.25, 0), struct.pack("<fI", -0.5, 0)),
+            ),
+            (
+                Control_Type.Torque_Pos,
+                "control_pos_force",
+                0x300,
+                ((0.25, 100, 3000), (-0.5, 65535, 10000)),
+                (
+                    struct.pack("<fHH", 0.25, 100, 3000),
+                    struct.pack("<fHH", -0.5, 65535, 10000),
+                ),
+            ),
         )
         for mode, method, can_id, commands, payloads in cases:
             with self.subTest(mode=mode):
                 sdk, motor, port = self.make_sdk(mode)
                 for command, payload in zip(commands, payloads):
                     getattr(sdk, method)(motor, *command)
-                    self.assertEqual(int.from_bytes(port.written[-1][13:15], "little"), can_id)
+                    self.assertEqual(
+                        int.from_bytes(port.written[-1][13:15], "little"), can_id
+                    )
                     self.assertEqual(port.written[-1][21:29], payload)
                 self.assertEqual(port.controls, [0, 0])
 
     def test_invalid_targets_never_reach_the_wire(self):
         cases = (
-            (Control_Type.MIT, "controlMIT", ((-1, 0, 0, 0, 0), (501, 0, 0, 0, 0),
-             (0, -1, 0, 0, 0), (0, 6, 0, 0, 0), (0, 0, 13, 0, 0),
-             (0, 0, 0, float("nan"), 0), (0, 0, 0, 0, float("inf")))),
-            (Control_Type.POS_VEL, "control_Pos_Vel", ((13, 0), (None, 0), (0, float("nan")))),
+            (
+                Control_Type.MIT,
+                "controlMIT",
+                (
+                    (-1, 0, 0, 0, 0),
+                    (501, 0, 0, 0, 0),
+                    (0, -1, 0, 0, 0),
+                    (0, 6, 0, 0, 0),
+                    (0, 0, 13, 0, 0),
+                    (0, 0, 0, float("nan"), 0),
+                    (0, 0, 0, 0, float("inf")),
+                ),
+            ),
+            (
+                Control_Type.POS_VEL,
+                "control_Pos_Vel",
+                ((13, 0), (None, 0), (0, float("nan"))),
+            ),
             (Control_Type.VEL, "control_Vel", ((float("inf"),),)),
-            (Control_Type.Torque_Pos, "control_pos_force", ((13, 0, 0), (0, -1, 0),
-             (0, 65536, 0), (0, 1.0, 0), (0, True, 0), (0, 0, -1), (0, 0, 10001))),
+            (
+                Control_Type.Torque_Pos,
+                "control_pos_force",
+                (
+                    (13, 0, 0),
+                    (0, -1, 0),
+                    (0, 65536, 0),
+                    (0, 1.0, 0),
+                    (0, True, 0),
+                    (0, 0, -1),
+                    (0, 0, 10001),
+                ),
+            ),
         )
         for mode, method, commands in cases:
             sdk, motor, port = self.make_sdk(mode)
@@ -262,9 +315,15 @@ class SDKTests(unittest.TestCase):
             namespace = runpy.run_path(str(EXAMPLE), run_name="example_import")
             connect.assert_not_called()
         main = namespace["main"]
-        main.__globals__.update(SLAVE_ID=0, MASTER_ID=0x20, RUN_SECONDS=0.025,
-                                CONTROL_PERIOD=0.01, STATUS_INTERVAL=1.0,
-                                TARGET_POSITION=0.1, TARGET_VELOCITY=0.2)
+        main.__globals__.update(
+            SLAVE_ID=0,
+            MASTER_ID=0x20,
+            RUN_SECONDS=0.025,
+            CONTROL_PERIOD=0.01,
+            STATUS_INTERVAL=1.0,
+            TARGET_POSITION=0.1,
+            TARGET_VELOCITY=0.2,
+        )
         port = ReplyingSerial([0])
         for target, replacement in (
             ("serial.Serial", lambda *args, **kwargs: port),
@@ -289,10 +348,16 @@ class SDKTests(unittest.TestCase):
         port.write = update_after_write
         with redirect_stdout(io.StringIO()):
             main()
-        commands = [data[21:29] for data in port.written if int.from_bytes(data[13:15], "little") == 0x100]
+        commands = [
+            data[21:29]
+            for data in port.written
+            if int.from_bytes(data[13:15], "little") == 0x100
+        ]
         self.assertGreaterEqual(len(commands), 2)
         self.assertEqual(commands[0], struct.pack("<ff", 0.1, 0.2))
-        self.assertTrue(all(data == struct.pack("<ff", -0.3, 0.4) for data in commands[1:]))
+        self.assertTrue(
+            all(data == struct.pack("<ff", -0.3, 0.4) for data in commands[1:])
+        )
         self.assertFalse(port.is_open)
         self.assertEqual(port.states[0], 0)
 
@@ -302,19 +367,35 @@ class SDKTests(unittest.TestCase):
 
         def moving_feedback(sid):
             position = 0x8000 + 100 * len(port.controls)
-            port.received += frame(0x20 + sid, [(port.states[sid] << 4) | sid,
-                position >> 8, position & 0xFF, 0x7F, 0xF7, 0xFF, 25, 25])
+            port.received += frame(
+                0x20 + sid,
+                [
+                    (port.states[sid] << 4) | sid,
+                    position >> 8,
+                    position & 0xFF,
+                    0x7F,
+                    0xF7,
+                    0xFF,
+                    25,
+                    25,
+                ],
+            )
 
         port.status = moving_feedback
         with redirect_stdout(io.StringIO()):
             main()
-        positions = [struct.unpack("<f", data[21:25])[0] for data in port.written
-                     if int.from_bytes(data[13:15], "little") == 0x100]
+        positions = [
+            struct.unpack("<f", data[21:25])[0]
+            for data in port.written
+            if int.from_bytes(data[13:15], "little") == 0x100
+        ]
         self.assertGreaterEqual(len(positions), 2)
         self.assertEqual(len(set(positions)), 1)
         self.assertAlmostEqual(positions[0], 12.5 / 65535, places=6)
 
-    def test_example_disables_and_closes_after_fault_timeout_bad_target_or_interrupt(self):
+    def test_example_disables_and_closes_after_fault_timeout_bad_target_or_interrupt(
+        self,
+    ):
         for failure in ("fault", "timeout", "target", "interrupt"):
             with self.subTest(failure=failure):
                 main, port = self.make_example()

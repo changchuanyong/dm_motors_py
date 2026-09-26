@@ -8,7 +8,12 @@ from motor import DM_Motor_Type, DM_variable, Motor, MotorControl
 
 
 def frame(can_id, payload, cmd=0x11):
-    return bytes([0xAA, cmd, 8]) + can_id.to_bytes(4, "little") + bytes(payload) + b"\x55"
+    return (
+        bytes([0xAA, cmd, 8])
+        + can_id.to_bytes(4, "little")
+        + bytes(payload)
+        + b"\x55"
+    )
 
 
 class MemorySerial:
@@ -76,7 +81,9 @@ class ReplyingSerial(MemorySerial):
                 value = self.param_values.get((sid, rid))
                 if value is not None:
                     encoding = "<I" if rid == DM_variable.CTRL_MODE else "<f"
-                    self.received += frame(0x20 + sid, payload[:4] + struct.pack(encoding, value))
+                    self.received += frame(
+                        0x20 + sid, payload[:4] + struct.pack(encoding, value)
+                    )
             elif command == 0x55:
                 encoding = "<I" if rid == DM_variable.CTRL_MODE else "<f"
                 self.param_values[sid, rid] = struct.unpack(encoding, payload[4:8])[0]
@@ -86,9 +93,14 @@ class ReplyingSerial(MemorySerial):
                 self.received += frame(0x20 + sid, payload)
             elif command == 0xCC:
                 self.queries += 1
-                if self.query_fault_after is not None and self.queries > self.query_fault_after:
+                if (
+                    self.query_fault_after is not None
+                    and self.queries > self.query_fault_after
+                ):
                     self.states[sid] = 8
-                if self.reply_queries and (self.query_limit is None or self.queries <= self.query_limit):
+                if self.reply_queries and (
+                    self.query_limit is None or self.queries <= self.query_limit
+                ):
                     self.status(sid)
         else:
             sid = can_id & 0x0F
@@ -133,7 +145,9 @@ class TransportRegressions(unittest.TestCase):
                 with self.subTest(state=state, marker=marker):
                     sdk, motor, serial = self.make_sdk()
                     sdk._MotorControl__read_RID_param(motor, DM_variable.PMAX)
-                    serial.received = frame(0x11, [(state << 4) | 1, 0, marker, 0x20, 7, 0xFF, 25, 25])
+                    serial.received = frame(
+                        0x11, [(state << 4) | 1, 0, marker, 0x20, 7, 0xFF, 25, 25]
+                    )
                     sdk.recv()
                     self.assertEqual(motor.getError(), state)
                     self.assertEqual(motor.feedback_count, 1)
@@ -148,7 +162,9 @@ class TransportRegressions(unittest.TestCase):
                     timestamp = motor.last_feedback_at
                     sdk._MotorControl__read_RID_param(motor, rid)
                     self.sleep(2.0)
-                    serial.received = frame(0x11, bytes([1, 0, command, rid]) + struct.pack("<f", 1.0))
+                    serial.received = frame(
+                        0x11, bytes([1, 0, command, rid]) + struct.pack("<f", 1.0)
+                    )
                     sdk.recv()
                     self.assertEqual(motor.getPosition(), 1.25)
                     self.assertEqual(motor.feedback_count, 1)

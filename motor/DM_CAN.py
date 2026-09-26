@@ -56,9 +56,15 @@ PARAM_REPLY_MARKERS = (0x33, 0x55, 0xAA)
 # 待处理请求的有效期，覆盖 SDK 自身 20 × 0.05 s 的重试窗口。
 PARAM_REPLY_TIMEOUT = 1.0
 STATUS_NAMES = {
-    0x00: "已失能", 0x01: "已使能", 0x08: "过压", 0x09: "欠压",
-    0x0A: "过流", 0x0B: "MOS 过温", 0x0C: "电机线圈过温",
-    0x0D: "通信丢失", 0x0E: "过载",
+    0x00: "已失能",
+    0x01: "已使能",
+    0x08: "过压",
+    0x09: "欠压",
+    0x0A: "过流",
+    0x0B: "MOS 过温",
+    0x0C: "电机线圈过温",
+    0x0D: "通信丢失",
+    0x0E: "过载",
 }
 
 
@@ -66,6 +72,7 @@ def _finite_values(**values):
     for name, value in values.items():
         if value is None or not math.isfinite(value):
             raise ValueError(f"{name} 必须是有限数")
+
 
 class Motor:
     def __init__(self, MotorType, SlaveID, MasterID):
@@ -76,7 +83,11 @@ class Motor:
         :param MasterID: MasterID 主机ID 建议不要设为0
         """
         for name, value in (("SlaveID", SlaveID), ("MasterID", MasterID)):
-            if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= 0x7FF:
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or not 0 <= value <= 0x7FF
+            ):
                 raise ValueError(f"{name} 必须是 0..0x7FF 的整数")
         if MasterID != 0 and SlaveID == MasterID:
             raise ValueError("SlaveID 和 MasterID 不能相同")
@@ -146,7 +157,7 @@ class Motor:
         :return: the error of the motor 电机错误码（缓存）
         """
         return self.state_err
-    
+
     def getParam(self, RID):
         """
         get the parameter of the motor 获取电机内部的参数，需要提前读取
@@ -158,26 +169,33 @@ class Motor:
         else:
             return None
 
+
 class MotorControl:
     send_data_frame = np.array(
-        [0x55, 0xAA, 0x1e, 0x03, 0x01, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x00, 0, 0, 0, 0, 0x00, 0x08, 0x00,
-         0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0x00], np.uint8)
+        [
+            0x55, 0xAA, 0x1e, 0x03, 0x01, 0x00, 0x00, 0x00,
+            0x0a, 0x00, 0x00, 0x00, 0x00, 0, 0, 0,
+            0, 0x00, 0x08, 0x00, 0x00, 0, 0, 0,
+            0, 0, 0, 0, 0, 0x00,
+        ],
+        np.uint8,
+    )
     Limit_Param = [
-        [12.5,    30,  10],  # DM4310
-        [12.5,    50,  10],  # DM4310_48
-        [12.5,    10,  28],  # DM4340
-        [12.5,    10,  28],  # DM4340_48
-        [12.5,    45,  20],  # DM6006
-        [12.5,    45,  40],  # DM8006
-        [12.5,    45,  54],  # DM8009
-        [12.5,    25, 200],  # DM10010L
-        [12.5,    20, 200],  # DM10010
-        [12.5,   280,   1],  # DMH3510
-        [12.5,    45,  10],  # DMG6215
-        [12.5,    45,  10],  # DMH6220
-        [12.5 ,   10 , 12],  # DMJH11
-        [12.566,  20, 120],  # DM6248P
-        [12.566,  50,   5],  # DM3507
+        [12.5, 30, 10],  # DM4310
+        [12.5, 50, 10],  # DM4310_48
+        [12.5, 10, 28],  # DM4340
+        [12.5, 10, 28],  # DM4340_48
+        [12.5, 45, 20],  # DM6006
+        [12.5, 45, 40],  # DM8006
+        [12.5, 45, 54],  # DM8009
+        [12.5, 25, 200],  # DM10010L
+        [12.5, 20, 200],  # DM10010
+        [12.5, 280, 1],  # DMH3510
+        [12.5, 45, 10],  # DMG6215
+        [12.5, 45, 10],  # DMH6220
+        [12.5, 10, 12],  # DMJH11
+        [12.566, 20, 120],  # DM6248P
+        [12.566, 50, 5],  # DM3507
     ]
 
     def __init__(self, serial_device, *, feedback_timeout=0.2):
@@ -215,12 +233,22 @@ class MotorControl:
         values = []
         for rid in (DM_variable.PMAX, DM_variable.VMAX, DM_variable.TMAX):
             value = self.read_motor_param(motor, rid)
-            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
-                raise RuntimeError(f"电机 0x{motor.SlaveID:02X} 的 {rid.name} 读取失败：{value!r}")
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value <= 0
+            ):
+                raise RuntimeError(
+                    f"电机 0x{motor.SlaveID:02X} 的 {rid.name} 读取失败：{value!r}"
+                )
             values.append(float(value))
         for other in self.motors:
             if other.MotorType == motor.MotorType and other.limits is not None:
-                if not all(math.isclose(a, b, rel_tol=1e-6, abs_tol=1e-6) for a, b in zip(values, other.limits)):
+                if not all(
+                    math.isclose(a, b, rel_tol=1e-6, abs_tol=1e-6)
+                    for a, b in zip(values, other.limits)
+                ):
                     raise RuntimeError("同型号电机的实际量程不一致，无法共用编解码表")
         self.change_limit_param(motor.MotorType, *values)
         motor.limits = tuple(values)
@@ -273,7 +301,9 @@ class MotorControl:
         if abs(value) > motor.limits[0]:
             raise ValueError(f"{name}={value} 超出电机实际位置量程 ±{motor.limits[0]}")
 
-    def controlMIT(self, DM_Motor, kp: float, kd: float, q: float, dq: float, tau: float):
+    def controlMIT(
+        self, DM_Motor, kp: float, kd: float, q: float, dq: float, tau: float
+    ):
         """
         MIT Control Mode Function 达妙电机MIT控制模式函数
         :param DM_Motor: Motor object 电机对象
@@ -310,7 +340,16 @@ class MotorControl:
         self.__send_data(DM_Motor.SlaveID, data_buf)
         self.check_status(DM_Motor)
 
-    def control_delay(self, DM_Motor, kp: float, kd: float, q: float, dq: float, tau: float, delay: float):
+    def control_delay(
+        self,
+        DM_Motor,
+        kp: float,
+        kd: float,
+        q: float,
+        dq: float,
+        tau: float,
+        delay: float,
+    ):
         """
         MIT Control Mode Function with delay 达妙电机MIT控制模式函数带延迟
         :param DM_Motor: Motor object 电机对象
@@ -373,7 +412,10 @@ class MotorControl:
         """
         self._check_command(Motor, Control_Type.Torque_Pos)
         self._check_position(Motor, Pos_des, "Pos_des")
-        for name, value, upper in (("Vel_des", Vel_des, 0xFFFF), ("i_des", i_des, 10000)):
+        for name, value, upper in (
+            ("Vel_des", Vel_des, 0xFFFF),
+            ("i_des", i_des, 10000),
+        ):
             if not isinstance(value, int) or isinstance(value, bool):
                 raise TypeError(f"{name} 必须使用 SDK 的整数编码值")
             if not 0 <= value <= upper:
@@ -391,7 +433,9 @@ class MotorControl:
         self.__send_data(motorid, data_buf)
         self.check_status(Motor)
 
-    def control_Pos_Vel_CSP(self, Motor, P_desired: float, V_desired: float):#谐波JH11电机有这个模式
+    def control_Pos_Vel_CSP(
+        self, Motor, P_desired: float, V_desired: float
+    ):  # 谐波JH11电机有这个模式
         """
         control the motor in position and velocity control mode 电机位置速度控制模式
         :param Motor: Motor object 电机对象
@@ -412,7 +456,7 @@ class MotorControl:
         # time.sleep(0.001)
         self.check_status(Motor)
 
-    def control_Vel_CSP(self, Motor, Vel_desired):#谐波JH11电机有这个模式
+    def control_Vel_CSP(self, Motor, Vel_desired):  # 谐波JH11电机有这个模式
         """
         control the motor in velocity control mode 电机速度控制模式
         :param Motor: Motor object 电机对象
@@ -427,7 +471,7 @@ class MotorControl:
         self.__send_data(motorid, data_buf)
         self.check_status(Motor)
 
-    def control_Tor_CSP(self, Motor, Tor_desired):#谐波JH11电机有这个模式
+    def control_Tor_CSP(self, Motor, Tor_desired):  # 谐波JH11电机有这个模式
         """
         control the motor in velocity control mode 电机速度控制模式
         :param Motor: Motor object 电机对象
@@ -471,7 +515,7 @@ class MotorControl:
             self.disable(Motor)
             raise
 
-    def enable_old(self, Motor ,ControlMode):
+    def enable_old(self, Motor, ControlMode):
         """
         enable motor old firmware 使能电机旧版本固件，这个是为了旧版本电机固件的兼容性
         可恶的旧版本固件使能需要加上偏移量
@@ -483,8 +527,10 @@ class MotorControl:
         try:
             self.recv()
             before = Motor.feedback_count
-            data_buf = np.array([0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfc], np.uint8)
-            enable_id = ((int(ControlMode)-1) << 2) + Motor.SlaveID
+            data_buf = np.array(
+                [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfc], np.uint8
+            )
+            enable_id = ((int(ControlMode) - 1) << 2) + Motor.SlaveID
             self.__send_data(enable_id, data_buf)
             sleep(0.1)
             self.recv()  # receive the data from serial port
@@ -531,11 +577,17 @@ class MotorControl:
                 continue
             slave_id = (int(data[1]) << 8) | int(data[0])
             motor = self.motors_map.get(slave_id)
-            if data[2] in PARAM_REPLY_MARKERS and motor is not None and motor.SlaveID == slave_id:
+            if (
+                data[2] in PARAM_REPLY_MARKERS
+                and motor is not None
+                and motor.SlaveID == slave_id
+            ):
                 # motors_map 同时包含 Master ID；必须核对完整 Slave ID，避免把含状态高四位
                 # 的 0x11/0x81 等反馈首字节误当作电机 1 的 ID。失能反馈若与参数帧完全重合，
                 # 保守按参数类处理，不能用猜测的位置/速度更新反馈时间戳。
-                if CANID in (motor.MasterID, motor.SlaveID, 0, 0x7FF) and self.__pending_param_reply(data):
+                if CANID in (
+                    motor.MasterID, motor.SlaveID, 0, 0x7FF
+                ) and self.__pending_param_reply(data):
                     self._param_request = None
                     self.__process_set_param_packet(data, CANID, CMD)
                 else:
@@ -567,7 +619,7 @@ class MotorControl:
         if CMD == 0x11:
             if CANID != 0x00:
                 if CANID in self.motors_map:
-                    err_int = int((np.uint8(data[0]) >> 4 ) & 0x0f)
+                    err_int = int((np.uint8(data[0]) >> 4) & 0x0f)
                     q_uint = np.uint16((np.uint16(data[1]) << 8) | data[2])
                     dq_uint = np.uint16((np.uint16(data[3]) << 4) | (data[4] >> 4))
                     tau_uint = np.uint16(((data[4] & 0xf) << 8) | data[5])
@@ -580,9 +632,9 @@ class MotorControl:
                     recv_tau = uint_to_float(tau_uint, -TAU_MAX, TAU_MAX, 12)
                     self.motors_map[CANID].recv_data(recv_q, recv_dq, recv_tau, err_int)
             else:
-                MasterID=data[0] & 0x0f
+                MasterID = data[0] & 0x0f
                 if MasterID in self.motors_map:
-                    err_int = int((np.uint8(data[0]) >> 4 ) & 0x0f)
+                    err_int = int((np.uint8(data[0]) >> 4) & 0x0f)
                     q_uint = np.uint16((np.uint16(data[1]) << 8) | data[2])
                     dq_uint = np.uint16((np.uint16(data[3]) << 4) | (data[4] >> 4))
                     tau_uint = np.uint16(((data[4] & 0xf) << 8) | data[5])
@@ -593,33 +645,34 @@ class MotorControl:
                     recv_q = uint_to_float(q_uint, -Q_MAX, Q_MAX, 16)
                     recv_dq = uint_to_float(dq_uint, -DQ_MAX, DQ_MAX, 12)
                     recv_tau = uint_to_float(tau_uint, -TAU_MAX, TAU_MAX, 12)
-                    self.motors_map[MasterID].recv_data(recv_q, recv_dq, recv_tau, err_int)
+                    self.motors_map[MasterID].recv_data(
+                        recv_q, recv_dq, recv_tau, err_int
+                    )
 
     def __process_set_param_packet(self, data, CANID, CMD):
         if CMD == 0x11 and (data[2] == 0x33 or data[2] == 0x55):
-            masterid=CANID
+            masterid = CANID
             slaveId = ((data[1] << 8) | data[0])
-            if CANID==0x00:  #防止有人把MasterID设为0稳一手
-                masterid=slaveId
+            if CANID == 0x00:  # 防止有人把MasterID设为0稳一手
+                masterid = slaveId
 
             if masterid not in self.motors_map:
                 if slaveId not in self.motors_map:
                     return
                 else:
-                    masterid=slaveId
+                    masterid = slaveId
 
             RID = data[3]
             # 读取参数得到的数据
             if is_in_ranges(RID):
-                #uint32类型
+                # uint32类型
                 num = uint8s_to_uint32(data[4], data[5], data[6], data[7])
                 self.motors_map[masterid].temp_param_dict[RID] = num
 
             else:
-                #float类型
+                # float类型
                 num = uint8s_to_float(data[4], data[5], data[6], data[7])
                 self.motors_map[masterid].temp_param_dict[RID] = num
-
 
     def addMotor(self, Motor):
         """
@@ -629,7 +682,10 @@ class MotorControl:
         ids = {Motor.SlaveID}
         if Motor.MasterID != 0:
             ids.add(Motor.MasterID)
-        if any(key in self.motors_map and self.motors_map[key] is not Motor for key in ids):
+        if any(
+            key in self.motors_map and self.motors_map[key] is not Motor
+            for key in ids
+        ):
             raise ValueError("电机 Slave/Master ID 重复或交叉占用")
         self.motors_map[Motor.SlaveID] = Motor
         if Motor.MasterID != 0:
@@ -651,21 +707,33 @@ class MotorControl:
         # 打印发送的原始hex数据
         # print(f"Sent raw HEX data (MotorID 0x{motor_id:02X}): {data.tobytes().hex()}")
         self.send_data_frame[13] = motor_id & 0xff
-        self.send_data_frame[14] = (motor_id >> 8)& 0xff  #id high 8 bits
+        self.send_data_frame[14] = (motor_id >> 8) & 0xff  # id high 8 bits
         self.send_data_frame[21:29] = data
         self.serial_.write(bytes(self.send_data_frame.T))
 
     def __read_RID_param(self, Motor, RID):
-        can_id_l = Motor.SlaveID & 0xff #id low 8 bits
-        can_id_h = (Motor.SlaveID >> 8)& 0xff  #id high 8 bits
-        data_buf = np.array([np.uint8(can_id_l), np.uint8(can_id_h), 0x33, np.uint8(RID), 0x00, 0x00, 0x00, 0x00], np.uint8)
+        can_id_l = Motor.SlaveID & 0xff  # id low 8 bits
+        can_id_h = (Motor.SlaveID >> 8) & 0xff  # id high 8 bits
+        data_buf = np.array(
+            [
+                np.uint8(can_id_l), np.uint8(can_id_h), 0x33, np.uint8(RID),
+                0x00, 0x00, 0x00, 0x00,
+            ],
+            np.uint8,
+        )
         self.__send_data(0x7FF, data_buf)
         self.__expect_param_reply(Motor.SlaveID, RID, 0x33)
 
     def __write_motor_param(self, Motor, RID, data):
-        can_id_l = Motor.SlaveID & 0xff #id low 8 bits
-        can_id_h = (Motor.SlaveID >> 8)& 0xff  #id high 8 bits
-        data_buf = np.array([np.uint8(can_id_l), np.uint8(can_id_h), 0x55, np.uint8(RID), 0x00, 0x00, 0x00, 0x00], np.uint8)
+        can_id_l = Motor.SlaveID & 0xff  # id low 8 bits
+        can_id_h = (Motor.SlaveID >> 8) & 0xff  # id high 8 bits
+        data_buf = np.array(
+            [
+                np.uint8(can_id_l), np.uint8(can_id_h), 0x55, np.uint8(RID),
+                0x00, 0x00, 0x00, 0x00,
+            ],
+            np.uint8,
+        )
         if not is_in_ranges(RID):
             # data is float
             data_buf[4:8] = float_to_uint8s(data)
@@ -687,7 +755,7 @@ class MotorControl:
         Motor.NowControlMode = None
         Motor.temp_param_dict.pop(DM_variable.CTRL_MODE, None)
         max_retries = 10
-        retry_interval = 0.05  #retry times
+        retry_interval = 0.05  # retry times
         RID = 10
         self.__write_motor_param(Motor, RID, np.uint8(ControlMode))
         for _ in range(max_retries):
@@ -695,7 +763,10 @@ class MotorControl:
             self.recv_set_param_data()
             if Motor.SlaveID in self.motors_map:
                 if RID in self.motors_map[Motor.SlaveID].temp_param_dict:
-                    if self.motors_map[Motor.SlaveID].temp_param_dict[RID] == ControlMode:
+                    if (
+                        self.motors_map[Motor.SlaveID].temp_param_dict[RID]
+                        == ControlMode
+                    ):
                         Motor.NowControlMode = ControlMode
                         return True
                     else:
@@ -708,9 +779,15 @@ class MotorControl:
         :param Motor: Motor object 电机对象
         :return:
         """
-        can_id_l = Motor.SlaveID & 0xff #id low 8 bits
-        can_id_h = (Motor.SlaveID >> 8)& 0xff  #id high 8 bits
-        data_buf = np.array([np.uint8(can_id_l), np.uint8(can_id_h), 0xAA, 0x00, 0x00, 0x00, 0x00, 0x00], np.uint8)
+        can_id_l = Motor.SlaveID & 0xff  # id low 8 bits
+        can_id_h = (Motor.SlaveID >> 8) & 0xff  # id high 8 bits
+        data_buf = np.array(
+            [
+                np.uint8(can_id_l), np.uint8(can_id_h), 0xAA, 0x00,
+                0x00, 0x00, 0x00, 0x00,
+            ],
+            np.uint8,
+        )
         self.disable(Motor)  # before save disable the motor
         self.__send_data(0x7FF, data_buf)
         self.__expect_param_reply(Motor.SlaveID, None, 0xAA)  # 保存应答不带 RID
@@ -728,8 +805,10 @@ class MotorControl:
         _finite_values(PMAX=PMAX, VMAX=VMAX, TMAX=TMAX)
         if min(PMAX, VMAX, TMAX) <= 0:
             raise ValueError("PMAX/VMAX/TMAX 必须大于 0")
-        if not all(math.isclose(a, b, rel_tol=1e-6, abs_tol=1e-6)
-                   for a, b in zip(self.Limit_Param[Motor_Type], (PMAX, VMAX, TMAX))):
+        if not all(
+            math.isclose(a, b, rel_tol=1e-6, abs_tol=1e-6)
+            for a, b in zip(self.Limit_Param[Motor_Type], (PMAX, VMAX, TMAX))
+        ):
             for motor in self.motors:
                 if motor.MotorType == Motor_Type:
                     motor.limits = None
@@ -737,14 +816,20 @@ class MotorControl:
         self.Limit_Param[Motor_Type][1] = VMAX
         self.Limit_Param[Motor_Type][2] = TMAX
 
-    def refresh_motor_status(self,Motor):
+    def refresh_motor_status(self, Motor):
         """
         get the motor status 获得电机状态
         """
         self._require_motor(Motor)
-        can_id_l = Motor.SlaveID & 0xff #id low 8 bits
-        can_id_h = (Motor.SlaveID >> 8) & 0xff  #id high 8 bits
-        data_buf = np.array([np.uint8(can_id_l), np.uint8(can_id_h), 0xCC, 0x00, 0x00, 0x00, 0x00, 0x00], np.uint8)
+        can_id_l = Motor.SlaveID & 0xff  # id low 8 bits
+        can_id_h = (Motor.SlaveID >> 8) & 0xff  # id high 8 bits
+        data_buf = np.array(
+            [
+                np.uint8(can_id_l), np.uint8(can_id_h), 0xCC, 0x00,
+                0x00, 0x00, 0x00, 0x00,
+            ],
+            np.uint8,
+        )
         self.__send_data(0x7FF, data_buf)
         self.recv()  # receive the data from serial port
 
@@ -765,13 +850,19 @@ class MotorControl:
             data = Control_Type(data)
             Motor.NowControlMode = None
         max_retries = 20
-        retry_interval = 0.05  #retry times
+        retry_interval = 0.05  # retry times
 
         self.__write_motor_param(Motor, RID, data)
         for _ in range(max_retries):
             self.recv_set_param_data()
-            if Motor.SlaveID in self.motors_map and RID in self.motors_map[Motor.SlaveID].temp_param_dict:
-                if abs(self.motors_map[Motor.SlaveID].temp_param_dict[RID] - data) < 0.1:
+            if (
+                Motor.SlaveID in self.motors_map
+                and RID in self.motors_map[Motor.SlaveID].temp_param_dict
+            ):
+                if (
+                    abs(self.motors_map[Motor.SlaveID].temp_param_dict[RID] - data)
+                    < 0.1
+                ):
                     if RID == DM_variable.CTRL_MODE:
                         Motor.NowControlMode = data
                     return True
@@ -793,7 +884,7 @@ class MotorControl:
         if RID == DM_variable.CTRL_MODE:
             Motor.NowControlMode = None
         max_retries = 20
-        retry_interval = 0.05  #retry times
+        retry_interval = 0.05  # retry times
         self.__read_RID_param(Motor, RID)
         for _ in range(max_retries):
             sleep(retry_interval)
@@ -817,7 +908,7 @@ class MotorControl:
 
         while i <= len(data) - frame_length:
             if data[i] == header and data[i + frame_length - 1] == tail:
-                frame = data[i:i + frame_length]
+                frame = data[i : i + frame_length]
                 frames.append(frame)
                 i += frame_length
             else:
@@ -922,6 +1013,7 @@ class DM_Motor_Type(IntEnum):
     DM6248P = 13
     DM3507 = 14
 
+
 class DM_variable(IntEnum):
     UV_Value = 0      # 欠压值 (Under Voltage threshold)
     KT_Value = 1      # 转矩常数或相关校准系数 (Torque constant / calibration)
@@ -968,6 +1060,7 @@ class DM_variable(IntEnum):
     dir = 55          # 旋转方向（正/反）(Direction)
     p_m = 80          # 极对数或机械极数 (Pole pairs / mechanical poles)
     xout = 81         # 外部输出或诊断输出寄存器 (External output / diagnostic output)
+
 
 class Control_Type(IntEnum):
     MIT = 1

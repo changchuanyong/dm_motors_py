@@ -30,18 +30,18 @@ SERIAL_PORT = "COM5"
 SERIAL_BAUDRATE = 921600
 SERIAL_TIMEOUT = 0.5
 
-RUN_SECONDS = 50.0       # 控制运行时间，单位 s
-CONTROL_PERIOD = 0.01   # 控制目标周期，单位 s；实际受通信耗时影响
+RUN_SECONDS = 50.0  # 控制运行时间，单位 s
+CONTROL_PERIOD = 0.01  # 控制目标周期，单位 s；实际受通信耗时影响
 STATUS_INTERVAL = 0.25  # 状态打印间隔，单位 s
 FEEDBACK_TIMEOUT = 0.2  # 反馈超时，单位 s；超时即停止控制并尝试失能
 
 # 本示例的目标；也可在下面的 while 循环中根据轨迹或反馈计算每周期目标。
 TARGET_POSITION = 10.0  # 绝对位置 rad；None 保持进入循环前的反馈位置
-TARGET_VELOCITY = 2.0   # 期望速度 rad/s
+TARGET_VELOCITY = 2.0  # 期望速度 rad/s
 
-SLAVE_ID = 0x01         # 0x00..0x0F
+SLAVE_ID = 0x01  # 0x00..0x0F
 MASTER_ID = 0x11
-DAMPING = None         # None 不写 Damp
+DAMPING = None  # None 不写 Damp
 SAVE_PARAMETERS = False  # True 将模式和可选阻尼配置保存到电机 flash
 
 
@@ -57,9 +57,15 @@ def print_status(motor: Motor) -> None:
 
 
 def main() -> None:
-    if not all(math.isfinite(value) for value in (
-        RUN_SECONDS, CONTROL_PERIOD, STATUS_INTERVAL, FEEDBACK_TIMEOUT,
-    )):
+    if not all(
+        math.isfinite(value)
+        for value in (
+            RUN_SECONDS,
+            CONTROL_PERIOD,
+            STATUS_INTERVAL,
+            FEEDBACK_TIMEOUT,
+        )
+    ):
         raise ValueError("循环时间参数必须是有限数")
     if RUN_SECONDS < 0 or CONTROL_PERIOD <= 0 or STATUS_INTERVAL < 0:
         raise ValueError("运行时间和打印间隔不能为负，控制周期必须大于 0")
@@ -76,6 +82,9 @@ def main() -> None:
         control.addMotor(motor)
         control.disable(motor)
         control.sync_motor_limits(motor)
+        # 换模式需同时修改这里的 Control_Type 和下面循环中的控制函数。
+        # 当前 POS_VEL 为位置速度；其他常用模式为 MIT、VEL、Torque_Pos。
+        # 保持“失能 -> 切换并确认模式 -> 使能”的顺序，模式不匹配时 SDK 会报错。
         if not control.switchControlMode(motor, Control_Type.POS_VEL):
             raise RuntimeError("切换位置速度模式失败")
         if DAMPING is not None:
@@ -93,12 +102,30 @@ def main() -> None:
         while time.monotonic() - start < RUN_SECONDS:
             cycle_start = time.monotonic()
             # 在这里计算本周期目标；读取反馈可用 motor.getPosition()/getVelocity()。
-            target_position = initial_position if TARGET_POSITION is None else TARGET_POSITION
+            target_position = (
+                initial_position if TARGET_POSITION is None else TARGET_POSITION
+            )
+            # 当前为 Control_Type.POS_VEL：位置 P_desired 单位 rad，速度 V_desired 单位 rad/s。
             control.control_Pos_Vel(
                 motor,
                 P_desired=target_position,
                 V_desired=TARGET_VELOCITY,
             )
+
+            # 换用以下任一模式时，用对应调用替换上面整段 control_Pos_Vel，并修改启动模式。
+            # 同一台电机每周期只使用与已配置模式对应的调用。
+            #
+            # MIT：启动选择 Control_Type.MIT。
+            # kp: 0..500，kd: 0..5；q: rad，dq: rad/s，tau: 前馈力矩 N·m。
+            # control.controlMIT(motor, kp=10.0, kd=1.0, q=target_position, dq=0.0, tau=0.0)
+            #
+            # 速度：启动选择 Control_Type.VEL；Vel_desired 单位 rad/s，可为负，不使用位置目标。
+            # control.control_Vel(motor, Vel_desired=TARGET_VELOCITY)
+            #
+            # 力位混合：启动选择 Control_Type.Torque_Pos；Pos_des 单位 rad。
+            # Vel_des 是速度乘 100 的整数，100 = 1 rad/s；
+            # i_des 是最大电流比例乘 10000 的整数，3000 = 30%，不是 mA。
+            # control.control_pos_force(motor, Pos_des=target_position, Vel_des=100, i_des=3000)
 
             now = time.monotonic()
             if now - last_status >= STATUS_INTERVAL:
