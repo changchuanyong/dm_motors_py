@@ -29,6 +29,7 @@ from motor import Control_Type, DM_Motor_Type, DM_variable, Motor, MotorControl
 SERIAL_PORT = "COM5"
 SERIAL_BAUDRATE = 921600
 SERIAL_TIMEOUT = 0.5
+SERIAL_WRITE_TIMEOUT = 0.1  # 单次串口写入超时，单位 s；必须为正有限数
 
 RUN_SECONDS = 50.0  # 控制运行时间，单位 s
 CONTROL_PERIOD = 0.01  # 控制目标周期，单位 s；实际受通信耗时影响
@@ -71,11 +72,23 @@ def main() -> None:
         raise ValueError("运行时间和打印间隔不能为负，控制周期必须大于 0")
     if FEEDBACK_TIMEOUT <= CONTROL_PERIOD:
         raise ValueError("反馈超时必须大于控制周期")
+    if (
+        isinstance(SERIAL_WRITE_TIMEOUT, bool)
+        or not isinstance(SERIAL_WRITE_TIMEOUT, (int, float))
+        or not math.isfinite(SERIAL_WRITE_TIMEOUT)
+        or SERIAL_WRITE_TIMEOUT <= 0
+    ):
+        raise ValueError("串口写入超时必须是正有限数")
     if DAMPING is not None and (not math.isfinite(DAMPING) or not 0 < DAMPING <= 100):
         raise ValueError("DAMPING 必须大于 0 且不超过 100")
 
     motor = Motor(DM_Motor_Type.DM6006, SLAVE_ID, MASTER_ID)
-    serial_device = serial.Serial(SERIAL_PORT, SERIAL_BAUDRATE, timeout=SERIAL_TIMEOUT)
+    serial_device = serial.Serial(
+        SERIAL_PORT,
+        SERIAL_BAUDRATE,
+        timeout=SERIAL_TIMEOUT,
+        write_timeout=SERIAL_WRITE_TIMEOUT,
+    )
     control = None
     try:
         control = MotorControl(serial_device, feedback_timeout=FEEDBACK_TIMEOUT)

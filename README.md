@@ -21,7 +21,7 @@ import serial
 from motor import Control_Type, DM_Motor_Type, Motor, MotorControl
 
 motor = Motor(DM_Motor_Type.DM6006, 0x01, 0x11)
-serial_device = serial.Serial("COM5", 921600, timeout=0.5)
+serial_device = serial.Serial("COM5", 921600, timeout=0.5, write_timeout=0.1)
 control = None
 try:
     control = MotorControl(serial_device, feedback_timeout=0.2)
@@ -48,6 +48,8 @@ finally:
 
 使用说明和接口注释见 [motor/DM_CAN.py](motor/DM_CAN.py)。完整控制循环见 [examples/DM_Motor_Example.py](examples/DM_Motor_Example.py)。许可证见 [LICENSE](LICENSE)。
 
+串口必须设置正有限的 `write_timeout`，否则 `MotorControl` 拒绝初始化。`timeout` 是读取超时，`feedback_timeout` 是反馈年龄检查，两者都不能中断阻塞的写入。写超时会传播驱动异常；未写完整帧会抛出 `OSError`，不自动补发，调用方仍通过 `finally` 尝试失能并关闭串口。
+
 ## 逐周期控制示例
 
 运行前修改 `examples/DM_Motor_Example.py` 顶部的用户配置区域，再从项目根目录运行：
@@ -73,6 +75,8 @@ python examples/DM_Motor_Example.py
 
 位置单位为 rad，MIT/位置速度/速度模式的速度单位为 rad/s。力位混合的 `Vel_des` 是速度乘 100 的整数，`i_des` 是电流标幺值乘 10000 的整数（0..10000）。位置参数必须是有限数；`None` 仅是本示例的起始位置约定，不能直接传给 SDK。
 
+使用 float32 编码的指令和参数还会检查编码后的值，拒绝 NaN、无穷和溢出；写入 PMAX/VMAX/TMAX 时编码后也必须大于 0。整数参数不能传入带小数部分的数值。
+
 这里的“逐周期控制”表示调用方每次传入最新目标，不保证硬实时。`recv()` 只处理串口当前已到达的字节，发送后立刻读取不保证已收到这次命令的应答。`getPosition()` 等读取的是缓存；SDK 按最近反馈时间检查超时。`control_Pos_Vel()` 内部有 1 ms 等待，实际周期还受通信、打印和系统调度影响。
 
 ## 多电机
@@ -89,7 +93,7 @@ motors = (
     Motor(DM_Motor_Type.DM6006, 0x03, 0x21),
 )
 modes = (Control_Type.MIT, Control_Type.VEL)
-serial_device = serial.Serial("COM5", 921600, timeout=0.5)
+serial_device = serial.Serial("COM5", 921600, timeout=0.5, write_timeout=0.1)
 control = None
 try:
     control = MotorControl(serial_device, feedback_timeout=0.2)
@@ -130,7 +134,7 @@ finally:
 
 ## 启动和反馈检查
 
-- `Motor.feedback_count`、`last_feedback_at` 只在收到有效反馈时更新；`status_name` 提供状态名称。
+- `Motor.feedback_count`、`last_feedback_at` 只在收到有效反馈时更新；接收要求 `CMD=0x11`、`DLC=8`，反馈中的低四位 ID 必须匹配所属电机的真实 Slave ID，不能借其他电机的 Master ID 映射通过。`status_name` 提供状态名称。
 - `sync_motor_limits(motor)` 从电机读取 PMAX/VMAX/TMAX，记录在 `motor.limits` 并对齐当前控制器的编解码表。同型号电机读到不同量程时拒绝继续。尝试写量程参数（即使写入失败），或用 `change_limit_param()` 改动对应型号的表，都会使相关 `limits` 失效；必须重新同步后才能控制。
 - `read_motor_param()`、`change_motor_param()` 和 `switchControlMode()` 先消费旧帧、清除目标缓存，再等待本次应答，避免旧值冒充成功。
 - `switchControlMode(motor, mode)` 只有确认应答后才登记 `NowControlMode`；必须检查返回值。新建电机默认没有已确认模式。

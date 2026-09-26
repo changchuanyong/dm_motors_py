@@ -14,7 +14,7 @@
     from motor import Control_Type, DM_Motor_Type, Motor, MotorControl
 
     motor = Motor(DM_Motor_Type.DM6006, 0x01, 0x11)
-    serial_device = serial.Serial("COM8", 921600, timeout=0.5)
+    serial_device = serial.Serial("COM8", 921600, timeout=0.5, write_timeout=0.1)
     control = None
     try:
         control = MotorControl(serial_device)
@@ -55,6 +55,7 @@ from struct import pack
 PARAM_REPLY_MARKERS = (0x33, 0x55, 0xAA)
 # 待处理请求的有效期，覆盖 SDK 自身 20 × 0.05 s 的重试窗口。
 PARAM_REPLY_TIMEOUT = 1.0
+FLOAT32_MAX = float(np.finfo(np.float32).max)
 STATUS_NAMES = {
     0x00: "已失能",
     0x01: "已使能",
@@ -72,6 +73,20 @@ def _finite_values(**values):
     for name, value in values.items():
         if value is None or not math.isfinite(value):
             raise ValueError(f"{name} 必须是有限数")
+
+
+def _float32_value(value):
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float, np.integer, np.floating))
+        or not math.isfinite(value)
+        or abs(float(value)) > FLOAT32_MAX
+    ):
+        raise ValueError("value 必须是 float32 可表示的有限数")
+    encoded = np.float32(value)
+    if not math.isfinite(float(encoded)):
+        raise ValueError("value 必须是 float32 可表示的有限数")
+    return float(encoded)
 
 
 class Motor:
@@ -206,6 +221,14 @@ class MotorControl:
         _finite_values(feedback_timeout=feedback_timeout)
         if feedback_timeout <= 0:
             raise ValueError("feedback_timeout 必须大于 0")
+        write_timeout = getattr(serial_device, "write_timeout", None)
+        if (
+            isinstance(write_timeout, bool)
+            or not isinstance(write_timeout, (int, float))
+            or not math.isfinite(write_timeout)
+            or write_timeout <= 0
+        ):
+            raise ValueError("serial_device.write_timeout 必须是正有限数")
         self.feedback_timeout = feedback_timeout
         self.serial_ = serial_device
         self.Limit_Param = [list(values) for values in type(self).Limit_Param]
@@ -571,6 +594,9 @@ class MotorControl:
             data = packet[7:15]
             CANID = (packet[6] << 24) | (packet[5] << 16) | (packet[4] << 8) | packet[3]
             CMD = packet[1]
+            if (packet[2] & 0x3F) != 8:
+                self.ignored_frames += 1
+                continue
             if CMD != 0x11:
                 # 适配器级帧：0x00 心跳、0x02 发送失败、0xEE 通信错误等，不含电机状态
                 self.ignored_frames += 1
@@ -618,36 +644,42 @@ class MotorControl:
     def __process_packet(self, data, CANID, CMD):
         if CMD == 0x11:
             if CANID != 0x00:
-                if CANID in self.motors_map:
+                motor = self.motors_map.get(CANID)
+                if motor is not None and (
+                    motor.SlaveID <= 0x0F
+                    and (int(data[0]) & 0x0F) == motor.SlaveID
+                ):
                     err_int = int((np.uint8(data[0]) >> 4) & 0x0f)
                     q_uint = np.uint16((np.uint16(data[1]) << 8) | data[2])
                     dq_uint = np.uint16((np.uint16(data[3]) << 4) | (data[4] >> 4))
                     tau_uint = np.uint16(((data[4] & 0xf) << 8) | data[5])
-                    MotorType_recv = self.motors_map[CANID].MotorType
+                    MotorType_recv = motor.MotorType
                     Q_MAX = self.Limit_Param[MotorType_recv][0]
                     DQ_MAX = self.Limit_Param[MotorType_recv][1]
                     TAU_MAX = self.Limit_Param[MotorType_recv][2]
                     recv_q = uint_to_float(q_uint, -Q_MAX, Q_MAX, 16)
                     recv_dq = uint_to_float(dq_uint, -DQ_MAX, DQ_MAX, 12)
                     recv_tau = uint_to_float(tau_uint, -TAU_MAX, TAU_MAX, 12)
-                    self.motors_map[CANID].recv_data(recv_q, recv_dq, recv_tau, err_int)
+                    motor.recv_data(recv_q, recv_dq, recv_tau, err_int)
             else:
                 MasterID = data[0] & 0x0f
-                if MasterID in self.motors_map:
+                motor = self.motors_map.get(MasterID)
+                if motor is not None and (
+                    motor.SlaveID <= 0x0F
+                    and MasterID == motor.SlaveID
+                ):
                     err_int = int((np.uint8(data[0]) >> 4) & 0x0f)
                     q_uint = np.uint16((np.uint16(data[1]) << 8) | data[2])
                     dq_uint = np.uint16((np.uint16(data[3]) << 4) | (data[4] >> 4))
                     tau_uint = np.uint16(((data[4] & 0xf) << 8) | data[5])
-                    MotorType_recv = self.motors_map[MasterID].MotorType
+                    MotorType_recv = motor.MotorType
                     Q_MAX = self.Limit_Param[MotorType_recv][0]
                     DQ_MAX = self.Limit_Param[MotorType_recv][1]
                     TAU_MAX = self.Limit_Param[MotorType_recv][2]
                     recv_q = uint_to_float(q_uint, -Q_MAX, Q_MAX, 16)
                     recv_dq = uint_to_float(dq_uint, -DQ_MAX, DQ_MAX, 12)
                     recv_tau = uint_to_float(tau_uint, -TAU_MAX, TAU_MAX, 12)
-                    self.motors_map[MasterID].recv_data(
-                        recv_q, recv_dq, recv_tau, err_int
-                    )
+                    motor.recv_data(recv_q, recv_dq, recv_tau, err_int)
 
     def __process_set_param_packet(self, data, CANID, CMD):
         if CMD == 0x11 and (data[2] == 0x33 or data[2] == 0x55):
@@ -709,7 +741,10 @@ class MotorControl:
         self.send_data_frame[13] = motor_id & 0xff
         self.send_data_frame[14] = (motor_id >> 8) & 0xff  # id high 8 bits
         self.send_data_frame[21:29] = data
-        self.serial_.write(bytes(self.send_data_frame.T))
+        frame = bytes(self.send_data_frame.T)
+        written = self.serial_.write(frame)
+        if written != len(frame):
+            raise OSError(f"串口只写入 {written!r}/{len(frame)} 字节，未自动重发")
 
     def __read_RID_param(self, Motor, RID):
         can_id_l = Motor.SlaveID & 0xff  # id low 8 bits
@@ -842,6 +877,7 @@ class MotorControl:
         :return: True or False ,True means success, False means fail
         """
         self._require_motor(Motor)
+        self._validate_param_value(RID, data)
         self.recv()
         Motor.temp_param_dict.pop(RID, None)
         if RID in (DM_variable.PMAX, DM_variable.VMAX, DM_variable.TMAX):
@@ -870,6 +906,27 @@ class MotorControl:
                     return False
             sleep(retry_interval)
         return False
+
+    def _validate_param_value(self, RID, data):
+        """发送参数前校验编码类型、float32 可表示性和量程参数正值。"""
+        if is_in_ranges(RID):
+            if (
+                isinstance(data, bool)
+                or not isinstance(data, int)
+                or not 0 <= data <= 0xFFFFFFFF
+            ):
+                raise ValueError(f"RID {RID} 必须是 0..0xFFFFFFFF 的整数")
+            return
+        if (
+            isinstance(data, bool)
+            or not isinstance(data, (int, float, np.integer, np.floating))
+            or not math.isfinite(data)
+        ):
+            raise ValueError(f"RID {RID} 必须是有限浮点数")
+        encoded = _float32_value(data)
+        if RID in (DM_variable.PMAX, DM_variable.VMAX, DM_variable.TMAX):
+            if data <= 0 or encoded <= 0:
+                raise ValueError(f"RID {RID} 必须编码为正数")
 
     def read_motor_param(self, Motor, RID):
         """
@@ -941,8 +998,9 @@ def uint_to_float(x: np.uint16, min: float, max: float, bits):
 
 
 def float_to_uint8s(value):
-    # Pack the float into 4 bytes
-    packed = pack('f', value)
+    # Pack the float into 4 bytes only after checking the target float32 range.
+    value32 = _float32_value(value)
+    packed = pack('<f', value32)
     # Unpack the bytes into four uint8 values
     return unpack('4B', packed)
 

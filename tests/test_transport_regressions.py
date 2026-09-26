@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import patch
 
 from motor import DM_Motor_Type, DM_variable, Motor, MotorControl
+from motor.DM_CAN import is_in_ranges
 
 
 def frame(can_id, payload, cmd=0x11):
@@ -19,6 +20,7 @@ def frame(can_id, payload, cmd=0x11):
 class MemorySerial:
     def __init__(self):
         self.is_open = False
+        self.write_timeout = 0.1
         self.received = b""
         self.written = []
 
@@ -80,12 +82,12 @@ class ReplyingSerial(MemorySerial):
             if command == 0x33:
                 value = self.param_values.get((sid, rid))
                 if value is not None:
-                    encoding = "<I" if rid == DM_variable.CTRL_MODE else "<f"
+                    encoding = "<I" if is_in_ranges(rid) else "<f"
                     self.received += frame(
                         0x20 + sid, payload[:4] + struct.pack(encoding, value)
                     )
             elif command == 0x55:
-                encoding = "<I" if rid == DM_variable.CTRL_MODE else "<f"
+                encoding = "<I" if is_in_ranges(rid) else "<f"
                 self.param_values[sid, rid] = struct.unpack(encoding, payload[4:8])[0]
                 self.received += frame(0x20 + sid, payload)
             elif command == 0xAA:
@@ -138,6 +140,100 @@ class TransportRegressions(unittest.TestCase):
         motor = Motor(DM_Motor_Type.DM6006, slave_id, master_id)
         sdk.addMotor(motor)
         return sdk, motor, serial
+
+    def test_invalid_dlc_does_not_refresh_feedback_and_next_frame_recovers(self):
+        for dlc in (0, 7, 9):
+            with self.subTest(dlc=dlc):
+                sdk, motor, serial = self.make_sdk()
+                motor.recv_data(1.25, 0, 0, 1)
+                timestamp = motor.last_feedback_at
+                self.sleep(0.05)
+                valid = frame(0x11, [0x11, 0x80, 0, 0x7F, 0xF7, 0xFF, 25, 25])
+                invalid = bytearray(valid)
+                invalid[2] = dlc
+                serial.received = bytes(invalid)
+                sdk.recv()
+                self.assertEqual(motor.feedback_count, 1)
+                self.assertEqual(motor.last_feedback_at, timestamp)
+                self.assertEqual(motor.getPosition(), 1.25)
+
+                serial.received = valid
+                sdk.recv()
+                self.assertEqual(motor.feedback_count, 2)
+                self.assertEqual(motor.last_feedback_at, self.now)
+
+    def test_invalid_dlc_cannot_complete_parameter_request(self):
+        for dlc in (0, 7, 9):
+            with self.subTest(dlc=dlc):
+                sdk, motor, serial = self.make_sdk()
+                sdk._MotorControl__read_RID_param(motor, DM_variable.PMAX)
+                valid = frame(0x11, b"\x01\x00\x33\x15" + struct.pack("<f", 6.25))
+                invalid = bytearray(valid)
+                invalid[2] = dlc
+                serial.received = bytes(invalid)
+                sdk.recv()
+                self.assertIsNone(motor.getParam(DM_variable.PMAX))
+                self.assertEqual(motor.feedback_count, 0)
+                self.assertIsNone(motor.last_feedback_at)
+
+                serial.received = valid
+                sdk.recv()
+                self.assertEqual(motor.getParam(DM_variable.PMAX), 6.25)
+                self.assertEqual(motor.feedback_count, 0)
+
+    def test_feedback_rejects_can_id_and_payload_motor_mismatch(self):
+        for can_id in (1, 0x11):
+            with self.subTest(can_id=can_id):
+                sdk, motor, serial = self.make_sdk()
+                other = Motor(DM_Motor_Type.DM6006, 3, 0x13)
+                sdk.addMotor(other)
+                serial.received = frame(
+                    can_id, [0x13, 0x80, 0, 0x7F, 0xF7, 0xFF, 25, 25]
+                )
+                sdk.recv()
+                for item in (motor, other):
+                    self.assertEqual(item.feedback_count, 0)
+                    self.assertIsNone(item.last_feedback_at)
+
+                serial.received = frame(
+                    can_id, [0x11, 0x80, 0, 0x7F, 0xF7, 0xFF, 25, 25]
+                )
+                sdk.recv()
+                self.assertEqual(motor.feedback_count, 1)
+                self.assertEqual(other.feedback_count, 0)
+
+    def test_zero_can_id_feedback_does_not_use_master_id_alias(self):
+        sdk, motor, serial = self.make_sdk(slave_id=1, master_id=3)
+        serial.received = frame(0, [0x13, 0x80, 0, 0x7F, 0xF7, 0xFF, 25, 25])
+        sdk.recv()
+        self.assertEqual(motor.feedback_count, 0)
+        self.assertIsNone(motor.last_feedback_at)
+
+        serial.received = frame(0, [0x11, 0x80, 0, 0x7F, 0xF7, 0xFF, 25, 25])
+        sdk.recv()
+        self.assertEqual(motor.feedback_count, 1)
+        self.assertEqual(motor.getError(), 1)
+
+    def test_feedback_accepts_slave_ids_zero_one_and_fifteen(self):
+        for slave_id in (0, 1, 15):
+            for can_id in (0, slave_id, 0x20 + slave_id):
+                for marker in (0x33, 0x55, 0xAA):
+                    with self.subTest(slave=slave_id, can_id=can_id, marker=marker):
+                        sdk, motor, serial = self.make_sdk(slave_id, 0x20 + slave_id)
+                        serial.received = frame(
+                            can_id, [0x10 | slave_id, 0, marker, 0x7F, 0xF7, 0xFF, 25, 25]
+                        )
+                        sdk.recv()
+                        self.assertEqual(motor.feedback_count, 1)
+                        self.assertIsNotNone(motor.last_feedback_at)
+                        self.assertEqual(motor.getError(), 1)
+
+    def test_standard_feedback_does_not_alias_full_slave_id(self):
+        sdk, motor, serial = self.make_sdk(slave_id=0x101)
+        serial.received = frame(0x11, [0x11, 0x80, 0, 0x7F, 0xF7, 0xFF, 25, 25])
+        sdk.recv()
+        self.assertEqual(motor.feedback_count, 0)
+        self.assertIsNone(motor.last_feedback_at)
 
     def test_enabled_and_fault_frames_survive_parameter_byte_collisions(self):
         for state in (1, 2, 8, 9, 10, 11, 12, 13, 14):

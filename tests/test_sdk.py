@@ -8,6 +8,8 @@ from contextlib import redirect_stdout, redirect_stderr
 from pathlib import Path
 from unittest.mock import patch
 
+from serial import SerialTimeoutException
+
 from motor import Control_Type, DM_Motor_Type, DM_variable, Motor, MotorControl
 from test_transport_regressions import MemorySerial, ReplyingSerial, frame
 
@@ -207,6 +209,91 @@ class SDKTests(unittest.TestCase):
                         getattr(sdk, method)(motor, *command)
                     self.assertEqual(len(port.written), before)
 
+    def test_float32_overflow_is_rejected_before_control_writes(self):
+        cases = (
+            (Control_Type.POS_VEL, "control_Pos_Vel", (0.0,), 25),
+            (Control_Type.VEL, "control_Vel", (), 21),
+            (Control_Type.POS_VEL_CSP, "control_Pos_Vel_CSP", (0.0,), 25),
+            (Control_Type.VEL_CSP, "control_Vel_CSP", (), 21),
+            (Control_Type.Torque_CSP, "control_Tor_CSP", (), 21),
+        )
+        maximum = struct.unpack("<f", b"\xFF\xFF\x7F\x7F")[0]
+        for mode, method, prefix, offset in cases:
+            sdk, motor, port = self.make_sdk(mode)
+            for value in (1e40, -1e40):
+                with self.subTest(mode=mode, invalid=value):
+                    before = len(port.written)
+                    with self.assertRaises(ValueError):
+                        getattr(sdk, method)(motor, *prefix, value)
+                    self.assertEqual(len(port.written), before)
+            for value in (maximum, -maximum):
+                with self.subTest(mode=mode, valid=value):
+                    getattr(sdk, method)(motor, *prefix, value)
+                    encoded = port.written[-1][offset : offset + 4]
+                    self.assertEqual(struct.unpack("<f", encoded)[0], value)
+
+    def test_invalid_parameter_values_are_rejected_before_writing(self):
+        sdk, motor, port = self.make_sdk(ready=False)
+        cases = (
+            (
+                DM_variable.Damp,
+                (float("nan"), float("inf"), -float("inf"), 1e40, -1e40),
+            ),
+            (DM_variable.PMAX, (-1.0, 0.0, 1e-50)),
+            (DM_variable.VMAX, (-1.0, 0.0, 1e-50)),
+            (DM_variable.TMAX, (-1.0, 0.0, 1e-50)),
+            (DM_variable.TIMEOUT, (1.9, -1, 0x100000000)),
+        )
+        for rid, values in cases:
+            for value in values:
+                with self.subTest(rid=rid, value=value):
+                    before = len(port.written)
+                    with self.assertRaises((ValueError, TypeError)):
+                        sdk.change_motor_param(motor, rid, value)
+                    self.assertEqual(len(port.written), before)
+        for rid, value, encoding in (
+            (DM_variable.Damp, 1.5, "<f"),
+            (DM_variable.PMAX, 6.25, "<f"),
+            (DM_variable.TIMEOUT, 100, "<I"),
+        ):
+            with self.subTest(valid_rid=rid):
+                self.assertTrue(sdk.change_motor_param(motor, rid, value))
+                self.assertEqual(
+                    port.written[-1][25:29], struct.pack(encoding, value)
+                )
+
+    def test_serial_write_timeout_must_be_finite_and_positive(self):
+        for value in (None, 0, -0.1, float("nan"), float("inf")):
+            with self.subTest(write_timeout=value):
+                port = MemorySerial()
+                port.write_timeout = value
+                with self.assertRaises(ValueError):
+                    MotorControl(port)
+                self.assertEqual(port.written, [])
+
+    def test_short_writes_and_serial_timeouts_abort_without_retry(self):
+        for failure in ("zero", "partial", "timeout"):
+            with self.subTest(failure=failure):
+                sdk, motor, port = self.make_sdk()
+                error = SerialTimeoutException("write timed out")
+
+                def fail_write(data):
+                    MemorySerial.write(port, data)
+                    if failure == "timeout":
+                        raise error
+                    return 0 if failure == "zero" else len(data) - 1
+
+                port.write = fail_write
+                before = len(port.written)
+                if failure == "timeout":
+                    with self.assertRaises(SerialTimeoutException) as caught:
+                        sdk.control_Vel(motor, 0.1)
+                    self.assertIs(caught.exception, error)
+                else:
+                    with self.assertRaises(OSError):
+                        sdk.control_Vel(motor, 0.1)
+                self.assertEqual(len(port.written), before + 1)
+
     def test_commands_require_measured_limits_and_confirmed_mode(self):
         sdk, motor, port = self.make_sdk(ready=False)
         sdk.enable(motor)
@@ -392,6 +479,45 @@ class SDKTests(unittest.TestCase):
         self.assertGreaterEqual(len(positions), 2)
         self.assertEqual(len(set(positions)), 1)
         self.assertAlmostEqual(positions[0], 12.5 / 65535, places=6)
+
+    def test_example_bounds_writes_and_attempts_cleanup_after_write_failure(self):
+        for failure in ("zero", "partial", "timeout"):
+            with self.subTest(failure=failure):
+                main, port = self.make_example()
+                write = port.write
+                error = SerialTimeoutException("write timed out")
+                failed = False
+
+                def fail_during_control(data):
+                    nonlocal failed
+                    if failed or int.from_bytes(data[13:15], "little") == 0x100:
+                        failed = True
+                        MemorySerial.write(port, data)
+                        if failure == "timeout":
+                            raise error
+                        return 0 if failure == "zero" else len(data) - 1
+                    return write(data)
+
+                port.write = fail_during_control
+                with patch("serial.Serial", return_value=port) as connect:
+                    with redirect_stdout(io.StringIO()), redirect_stderr(
+                        io.StringIO()
+                    ):
+                        with self.assertRaises(OSError) as caught:
+                            main()
+                if failure == "timeout":
+                    self.assertIs(caught.exception, error)
+                self.assertEqual(connect.call_args.kwargs["write_timeout"], 0.1)
+                self.assertEqual(main.__globals__["SERIAL_WRITE_TIMEOUT"], 0.1)
+                self.assertEqual(
+                    sum(
+                        int.from_bytes(data[13:15], "little") == 0x100
+                        for data in port.written
+                    ),
+                    1,
+                )
+                self.assertEqual(port.written[-1][21:29], b"\xFF" * 7 + b"\xFD")
+                self.assertFalse(port.is_open)
 
     def test_example_disables_and_closes_after_fault_timeout_bad_target_or_interrupt(
         self,
