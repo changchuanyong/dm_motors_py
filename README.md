@@ -60,6 +60,14 @@ python examples/DM_Motor_Example.py
 
 默认串口为 `COM5`，一台 `0x01:0x11` 电机使用位置速度模式，运行 50 s、目标周期 10 ms。`TARGET_POSITION=10.0` 是绝对位置 10 rad，`TARGET_VELOCITY=2.0` 是速度参数 2 rad/s。`TARGET_POSITION=None` 时，示例在使能确认后捕获一次反馈位置并保持该目标。轨迹或传感器反馈计算直接写在循环内，再将数值传给 `control_Pos_Vel()`。
 
+## MIT 单位脉冲响应测试
+
+运行 `examples/DM_Motor_Impulse_Response.py` 可测试电机的脉冲响应：示例切换到 MIT 模式，
+将 `kp=0`、`kd=0`，在一个控制周期内发送默认 `tau=1 N·m`，之后持续发送 `tau=0`，
+观察电机是否转动并在无主动阻尼的情况下逐渐停下。运行时间、脉冲力矩、判定阈值和串口参数
+都在文件顶部配置；反馈样本默认保存为 `impulse_response.csv`，可将 `CSV_OUTPUT` 设为 `None`
+关闭保存。结束时会报告最大位移、末段最大速度以及是否通过判定。
+
 启动顺序为：注册电机 → 失能 → 读取实际 PMAX/VMAX/TMAX 并对齐 SDK 量程 → 切换并确认模式 → 使能并确认新反馈。可选的 `DAMPING` 修改和 `SAVE_PARAMETERS` 保存放在使能之前；保存会写电机 flash，不应每个控制周期执行。
 
 运行结束、异常或 `Ctrl+C` 都通过 `finally` 尝试失能并关闭串口。关闭串口不等于电机已确认失能；示例的清理只保证尝试发送失能命令，发送失败会明确打印。

@@ -1,5 +1,17 @@
 __pycache__/
 *.py[cod]
+*.pyd
+*.so
+*.dylib
+*.dll
+*.o
+*.obj
+*.a
+*.lib
+*.exp
+*.ilk
+*.exe
+*.whl
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
@@ -11,5 +23,8 @@ env/
 build/
 dist/
 *.egg-info/
+CMakeFiles/
+CMakeCache.txt
+cmake-build-*/
 .idea/
 .vscode/
